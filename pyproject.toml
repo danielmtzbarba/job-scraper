@@ -8,9 +8,20 @@ dependencies = [
     "curl-cffi>=0.16.3",
     "fastapi>=0.142.2",
     "httpx>=0.28.1",
+    "mcp[cli]>=2.0.0,<3.0.0",
     "pydantic>=2.12.0",
     "python-dotenv>=1.1.0",
     "python-multipart>=0.0.32",
     "structlog>=26.1.0",
     "uvicorn>=0.54.0",
 ]
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["job_scraper"]
+
+[project.scripts]
+job-scraper-mcp = "job_scraper.mcp.server:main"

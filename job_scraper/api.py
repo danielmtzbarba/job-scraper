@@ -22,7 +22,11 @@ from job_scraper.models.jobs import (
     JobSummary,
     SearchImportResponse,
 )
-from job_scraper.integrations.airtable import AirtableClient, AirtableSettings
+from job_scraper.application.airtable_sync import airtable_sync_worker
+from job_scraper.application.jobs import JobService
+from job_scraper.application.profiles import ProfileStore
+from job_scraper.integrations.airtable import AirtableSettings
+from job_scraper.mcp.server import ServerContext, create_server
 from job_scraper.sources.arbeitsagentur.html_parser import JobPosting, parse_html
 from job_scraper.logging_config import setup_logging
 from job_scraper.storage.sqlite_jobs import SQLiteJobRepository
@@ -33,6 +37,7 @@ BA_ORIGIN = "https://www.arbeitsagentur.de"
 JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 logger = setup_logging("job-scraper-api")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -44,7 +49,13 @@ BLOCKED_STATUS_CODES = {403, 429, 503}
 
 def _database_path() -> Path:
     configured = os.getenv("JOB_SCRAPER_DB_PATH", ".local/jobs.db")
-    return Path(configured).expanduser()
+    path = Path(configured).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _profile_dir() -> Path:
+    path = Path(os.getenv("JOB_SCRAPER_PROFILE_DIR", ".local/profiles")).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def _detail_fetch_interval() -> int:
@@ -106,61 +117,13 @@ async def detail_fetcher_cron(
     logger.info("detail_fetcher_stopped")
 
 
-async def airtable_sync_cron(
-    repository: SQLiteJobRepository, settings: AirtableSettings
-) -> None:
-    """Sync locally completed jobs to Airtable and retry transient failures."""
-    client = AirtableClient(settings)
-    logger.info("airtable_sync", action="worker_started")
-    try:
-        while True:
-            try:
-                item = repository.claim_next_airtable_sync()
-                if item is None:
-                    await asyncio.sleep(settings.poll_interval_seconds)
-                    continue
-                try:
-                    record_id, action = await client.sync(item)
-                    repository.mark_airtable_synced(
-                        item.source, item.deduplication_key, record_id
-                    )
-                    logger.info(
-                        "airtable_sync",
-                        action=action,
-                        deduplication_key=item.deduplication_key,
-                    )
-                except asyncio.CancelledError:
-                    repository.mark_airtable_sync_failed(
-                        item.source,
-                        item.deduplication_key,
-                        "Sync worker stopped during an Airtable request.",
-                    )
-                    raise
-                except Exception as exc:
-                    repository.mark_airtable_sync_failed(
-                        item.source, item.deduplication_key, str(exc)
-                    )
-                    logger.warning(
-                        "airtable_sync",
-                        action="job_sync_failed",
-                        deduplication_key=item.deduplication_key,
-                    )
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.error("airtable_sync", action="worker_iteration_failed")
-                await asyncio.sleep(settings.poll_interval_seconds)
-    finally:
-        await client.close()
-        logger.info("airtable_sync", action="worker_stopped")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_dotenv(override=False)
     repository = SQLiteJobRepository(_database_path())
     repository.initialize()
     app.state.jobs = repository
+    app.state.profiles = ProfileStore(_profile_dir())
     worker_task = asyncio.create_task(
         detail_fetcher_cron(repository, interval_seconds=_detail_fetch_interval())
     )
@@ -168,12 +131,13 @@ async def lifespan(app: FastAPI):
     airtable_task = None
     if airtable_settings:
         airtable_task = asyncio.create_task(
-            airtable_sync_cron(repository, airtable_settings)
+            airtable_sync_worker(repository, airtable_settings)
         )
     else:
         logger.warning("airtable_sync", action="worker_disabled")
     try:
-        yield
+        async with mcp_server.session_manager.run():
+            yield
     finally:
         worker_task.cancel()
         if airtable_task:
@@ -196,6 +160,17 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+def _mcp_context() -> ServerContext:
+    return ServerContext(
+        jobs=JobService(app.state.jobs),
+        profiles=app.state.profiles,
+    )
+
+
+mcp_server = create_server(context_provider=_mcp_context)
+mcp_http_app = mcp_server.streamable_http_app(json_response=True)
 
 
 def _repository(request: Request) -> SQLiteJobRepository:
@@ -407,3 +382,7 @@ def _job_summary(posting: JobPosting) -> JobSummary:
         employer_job_url=posting.employer_job_url,
         posted_at=posting.posted_at,
     )
+
+
+# Keep this mount after API routes; the MCP app serves /mcp on the same port.
+app.mount("/", mcp_http_app)

@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 from datetime import datetime
-from typing import Any
+from typing import Any, TextIO
 
 import structlog
 
@@ -84,11 +84,16 @@ def _scrub_sensitive_fields(
     return event_dict
 
 
-def setup_logging(service_name: str, level: int = logging.INFO) -> Any:
+def setup_logging(
+    service_name: str,
+    level: int = logging.INFO,
+    *,
+    stream: TextIO = sys.stdout,
+) -> Any:
     """Configure structured logs; ENV=production selects JSON output."""
     production = os.getenv("ENV", "development").lower() == "production"
     logging.basicConfig(
-        format="%(message)s", stream=sys.stdout, level=level, force=True
+        format="%(message)s", stream=stream, level=level, force=True
     )
     processors: list[Any] = [
         structlog.contextvars.merge_contextvars,
