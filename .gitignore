@@ -1,0 +1,22 @@
+# Python and uv
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+
+# Local/private user data
+.local/
+data/private/
+data/cv/
+profiles/private/
+
+# Tool output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
