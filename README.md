@@ -51,14 +51,54 @@ curl -F 'file=@.local/symate-detail.html' \
 
 Inspect completed local job rows at `GET /jobs` or `GET /jobs/{source_job_id}`. Re-importing updates known source fields without replacing application or fit statuses. SQLite has two application tables: `job_processing` stores a Pydantic-validated JSON payload and fetch/sync state; `jobs` mirrors the Airtable `Jobs` data fields and contains only publishable job records. Successful detail parsing moves a job into `jobs` and marks it `ReadyToSync`; the Airtable sync worker then creates or updates the matching record and marks it `Synced`. Airtable-managed application status, notes, and scoring fields are preserved when updating an existing row. Failed Airtable requests retry with exponential backoff, up to eight attempts.
 
-The Airtable Personal Access Token is read from `AIRTABLE_TOKEN` in `.env` via `python-dotenv`. The base and table default to this project's existing `JobBoard Base` / `Jobs`; override them with `AIRTABLE_BASE_ID` and `AIRTABLE_TABLE_ID` if needed. `AIRTABLE_SYNC_POLL_SECONDS` controls how often the worker checks for ready records. `.env` is gitignored; never commit the token.
+
+## Local MCP server
+
+The FastAPI service also hosts the MCP adapter at `http://127.0.0.1:8000/mcp` using Streamable HTTP. Start FastAPI with the command above, then register that URL with Codex:
+
+```sh
+codex mcp add job-scraper --url http://127.0.0.1:8000/mcp
+codex mcp list
+```
+
+Keep the FastAPI process running while using the tools in Codex. Bind it to `127.0.0.1` for local use; the HTTP endpoint has no user authentication. The API and MCP tools use the same SQLite repository, private profile store, and Airtable sync worker in one process. An optional standalone stdio transport remains available for MCP hosts that launch their own server process:
+
+```sh
+uv run --cache-dir .local/uv-cache job-scraper-mcp
+```
+
+An MCP host should launch the stdio command with the repository as its working directory. Use `uv run --cache-dir .local/uv-cache mcp dev job_scraper/mcp/server.py` to inspect the registered tools during local development.
+
+Available tools:
+
+- `search_jobs` filters by text, source, and fit status. Use `fit_status="Pending"` to find jobs awaiting scoring.
+- `list_scoring_profiles` lists the five private role profiles and their review status.
+- `get_scoring_profile` returns one complete profile for review.
+- `get_job_for_scoring` requires a `profile_id` and returns one fully rendered prompt containing the JD, selected profile, and rubric, plus their version metadata. It never reads the CV dossier at scoring time.
+- `save_fit_assessment` requires current profile, rubric, and prompt versions. It validates the two 0–100 scores and category, calculates the 50/50 overall score, records local score provenance, and queues the Airtable update.
+- `mark_fit_needs_review` records why the JD cannot be scored reliably and clears any earlier numeric score.
+- `update_application_status` updates application status and optionally replaces notes (pass an empty string to clear them); the update is queued for the same retryable Airtable sync worker.
+
+FastAPI starts one Airtable sync worker when `AIRTABLE_TOKEN` is configured. The standalone stdio server starts its own worker if run separately. Local Streamable HTTP is available now; remote hosting and personal-account authentication are deferred until the GCP deployment phase.
+
+The versioned rubric and prompt are defined in `job_scraper/application/scoring_prompt.py`. Skill/stack fit assigns up to 70 points to required skills, 20 to preferred skills, and 10 to evidence of using the stack together. Experience fit assigns up to 60 points to direct responsibilities, 25 to comparable delivery and ownership, and 15 to transferable adjacent work. Overall categories are Strong (85–100), Good (70–<85), Stretch (50–<70), and Low (<50). If the JD lacks essential information, the assistant uses `mark_fit_needs_review` instead of inventing scores. The prompt tells the assistant to treat JD and profile content as data, cite evidence IDs, and report key gaps. The local server does not call Gemini automatically.
+
+### Private career profiles
+
+Five user-reviewed profiles live under the ignored `.local/profiles/` directory: `swe`, `applied_ai_fde`, `ai_engineer`, `backend`, and `platform_devops`. Each has a `v1.json` file; `current.json` selects one version per role. Their JSON documents share the Pydantic contract in `job_scraper/models/profiles.py`. Each skill refers to evidence embedded in the same profile. The evidence carries source references for human review, but scoring does not load those sources. Profile files are deliberately excluded from Git because they contain personal career information.
+
+The private `.local/profiles/build.py` script compiles initial drafts from selected entries in the candidate dossier at `/Users/danielmtz/Data/cv/agentic-cv-creator`; it uses that repository's Python environment for PyYAML. Re-running it overwrites the reviewed v1 profiles, so preserve changes in a new version. New drafts require user review before changing their `status` to `reviewed`; scoring with a draft is blocked. Set `JOB_SCRAPER_PROFILE_DIR` to load profiles from another private directory. Validate all five with:
+
+```sh
+.venv/bin/python -c 'from pathlib import Path; from job_scraper.application.profiles import ProfileStore; print([(p.id, p.version, len(p.evidence)) for p in ProfileStore(Path(".local/profiles")).list()])'
+```
 
 ## Implementation sequence
 
 1. Define canonical job records and build the local Apify → normalize/deduplicate → Airtable vertical slice for one source.
-2. Add Gemini scoring as a separate stage that updates stored jobs with skill/stack and CV-based experience scores.
+2. Add unattended Gemini/Vertex AI scoring as a separate worker; the local MCP tools already accept assistant-generated scores during an interactive session.
 3. Sort and report scored results; then add Gmail success digests and Slack failure alerts.
-4. Expose the same use cases to ChatGPT/Codex through MCP; add FastAPI only if REST endpoints are independently useful.
+4. Calibrate the five reviewed career profiles and rubric against real JDs; add personal-account authentication before any remote deployment.
 5. Verify actor/source costs and the $10/month ceiling, then plan GCP deployment separately.
 
 See [AGENTS.md](AGENTS.md) for working guidance and [state.md](state.md) for the confirmed requirements and open implementation decisions.
