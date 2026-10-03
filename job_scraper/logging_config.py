@@ -28,7 +28,9 @@ _LEVEL_COLORS = {
     "ERROR": "\033[31m",
     "CRITICAL": "\033[1;31m",
 }
-_KEY_COLOR = "\033[96m"
+_DATE_COLOR = "\033[38;5;245m"
+_TIME_COLOR = "\033[38;5;117m"
+_KEY_COLOR = _TIME_COLOR
 _RESET = "\033[0m"
 _MCP_SESSION_MESSAGES = (
     (re.compile(r"^Rejected request with unknown or expired session ID: (.+)$"), "mcp_session_rejected"),
@@ -48,6 +50,13 @@ class KeyValueConsoleRenderer:
         values = dict(event_dict)
         level = str(values.pop("level", "INFO")).upper()
         timestamp = _local_timestamp(values.pop("timestamp", None))
+        date, separator, time = timestamp.partition(" ")
+        colored_timestamp = (
+            f"{_DATE_COLOR}{date}{_RESET} "
+            f"{_TIME_COLOR}{time}{_RESET}"
+            if separator
+            else timestamp
+        )
         event = str(values.pop("event", "log_event"))
         values.pop("logger", None)
 
@@ -58,8 +67,8 @@ class KeyValueConsoleRenderer:
         level_color = _LEVEL_COLORS.get(level, _RESET)
         prefix = (
             f"{level_color}[ {level} ]{_RESET} : "
-            f"{timestamp} : "
-            f"{_KEY_COLOR}[ {event} ]{_RESET}"
+            f"{colored_timestamp} : "
+            f"{level_color}[ {event} ]{_RESET}"
         )
         return f"{prefix} : {rendered_fields}" if rendered_fields else f"{prefix} :"
 

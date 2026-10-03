@@ -29,7 +29,7 @@ Start the service on localhost:
 uv run uvicorn job_scraper.api:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Application logs use structured `structlog`: local console lines use `[ INFO ] : DD.MM.YYYY HH:MM:SS.mmm : [ event_name ] : key=value`, with green INFO, yellow WARNING, red ERROR, the date and values in the terminal's default color, and cyan event labels and keys; `ENV=production` selects JSON. Airtable worker logs include only `action` and, for job-specific events, `deduplication_key`. Logs go to stdout, redact fields whose names indicate credentials or tokens, and suppress routine HTTP client/access chatter.
+Application logs use structured `structlog`: local console lines use `[ INFO ] : DD.MM.YYYY HH:MM:SS.mmm : [ event_name ] : key=value`, with matching colors for each level and event label (green INFO, yellow WARNING, red ERROR), a muted slate date, soft blue time and keys, and values in the terminal's default color; `ENV=production` selects JSON. Airtable worker logs include only `action` and, for job-specific events, `deduplication_key`. Logs go to stdout, redact fields whose names indicate credentials or tokens, and suppress routine HTTP client/access chatter.
 
 The MCP SDK's Streamable HTTP session messages use the same format. `mcp_session_created` and `mcp_session_terminated` mark session lifecycle events. `mcp_session_rejected` is a DEBUG event (hidden at the default INFO level): it means a client sent an unknown or expired session ID; the request receives HTTP 404 and the client must initialize a new session. Repeated rejections for one ID usually mean the client is still retrying a stale session after a restart or termination.
 
