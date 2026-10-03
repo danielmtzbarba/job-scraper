@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime
 from typing import Any, TextIO
@@ -29,6 +30,15 @@ _LEVEL_COLORS = {
 }
 _KEY_COLOR = "\033[96m"
 _RESET = "\033[0m"
+_MCP_SESSION_MESSAGES = (
+    (re.compile(r"^Rejected request with unknown or expired session ID: (.+)$"), "mcp_session_rejected"),
+    (re.compile(r"^Created new transport with session ID: (.+)$"), "mcp_session_created"),
+    (re.compile(r"^Terminating session: (.+)$"), "mcp_session_terminated"),
+)
+_MCP_TRANSPORT_LOGGERS = (
+    "mcp.server.streamable_http_manager",
+    "mcp.server.streamable_http",
+)
 
 
 class KeyValueConsoleRenderer:
@@ -84,6 +94,45 @@ def _scrub_sensitive_fields(
     return event_dict
 
 
+class MCPTransportFormatter(logging.Formatter):
+    """Render MCP SDK transport messages with the application's log format."""
+
+    def __init__(self, *, production: bool) -> None:
+        super().__init__()
+        self.production = production
+        self.console_renderer = KeyValueConsoleRenderer()
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = record.getMessage()
+        event_dict: dict[str, Any] = {
+            "level": record.levelname.lower(),
+            "timestamp": datetime.fromtimestamp(record.created).astimezone().isoformat(),
+            "event": "mcp_transport_log",
+            "message": message,
+        }
+        for pattern, event_name in _MCP_SESSION_MESSAGES:
+            match = pattern.fullmatch(message)
+            if match:
+                event_dict["event"] = event_name
+                event_dict.pop("message")
+                event_dict["session_id"] = match.group(1)
+                break
+        _scrub_sensitive_fields(None, "", event_dict)
+        if self.production:
+            return json.dumps(event_dict, ensure_ascii=False)
+        return self.console_renderer(None, "", event_dict)
+
+
+class MCPTransportLevelFilter(logging.Filter):
+    """Treat stale MCP session requests as debug diagnostics."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if _MCP_SESSION_MESSAGES[0][0].fullmatch(record.getMessage()):
+            record.levelno = logging.DEBUG
+            record.levelname = logging.getLevelName(logging.DEBUG)
+        return True
+
+
 def setup_logging(
     service_name: str,
     level: int = logging.INFO,
@@ -120,4 +169,21 @@ def setup_logging(
     for logger_name in ("httpx", "httpcore", "uvicorn.access"):
         dependency_logger = logging.getLogger(logger_name)
         dependency_logger.setLevel(logging.WARNING)
+
+    for logger_name in _MCP_TRANSPORT_LOGGERS:
+        transport_logger = logging.getLogger(logger_name)
+        for existing_filter in transport_logger.filters[:]:
+            if isinstance(existing_filter, MCPTransportLevelFilter):
+                transport_logger.removeFilter(existing_filter)
+        transport_logger.addFilter(MCPTransportLevelFilter())
+        for handler in transport_logger.handlers[:]:
+            if getattr(handler, "_job_scraper_mcp_handler", False):
+                transport_logger.removeHandler(handler)
+                handler.close()
+        handler = logging.StreamHandler(stream)
+        handler._job_scraper_mcp_handler = True
+        handler.setLevel(level)
+        handler.setFormatter(MCPTransportFormatter(production=production))
+        transport_logger.addHandler(handler)
+        transport_logger.propagate = False
     return structlog.get_logger(service_name)
