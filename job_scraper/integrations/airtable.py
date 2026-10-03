@@ -81,7 +81,9 @@ class AirtableClient:
 
         if item.airtable_record_id:
             try:
-                record_id = await self._update(item.airtable_record_id, source_fields)
+                record_id = await self._update(
+                    item.airtable_record_id, source_fields | item.additional_fields
+                )
                 return record_id, "updated"
             except AirtableSyncError as exc:
                 if "HTTP 404" not in str(exc):
@@ -95,7 +97,9 @@ class AirtableClient:
                 "Multiple Airtable rows match the source and deduplication key."
             )
         if existing_ids:
-            record_id = await self._update(existing_ids[0], source_fields)
+            record_id = await self._update(
+                existing_ids[0], source_fields | item.additional_fields
+            )
             return record_id, "updated"
 
         record_id = await self._create(full_fields)

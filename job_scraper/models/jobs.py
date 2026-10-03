@@ -94,6 +94,7 @@ class AirtableSyncWorkItem(BaseModel):
     source: str
     deduplication_key: str
     airtable_record_id: str | None = None
+    additional_fields: dict[str, object] = Field(default_factory=dict)
     attempts: int
     record: JobMirrorRecord
 

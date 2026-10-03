@@ -23,6 +23,7 @@ _FETCH_UPDATE_FIELDS = (
     "title", "company", "source_job_id", "job_url", "job_description", "location",
     "work_mode", "employment_type", "application_url", "posted_at",
 )
+_STALE_PROCESSING_MINUTES = 10
 
 
 class SQLiteJobRepository:
@@ -88,11 +89,22 @@ class SQLiteJobRepository:
                     fetch_next_retry_at TEXT,
                     airtable_next_retry_at TEXT,
                     airtable_record_id TEXT,
+                    airtable_pending_fields_json TEXT NOT NULL DEFAULT '{}',
                     airtable_sync_status TEXT NOT NULL DEFAULT 'Pending',
                     airtable_sync_attempts INTEGER NOT NULL DEFAULT 0,
                     airtable_sync_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    PRIMARY KEY (source, deduplication_key)
+                );
+                CREATE TABLE IF NOT EXISTS fit_assessment_provenance (
+                    source TEXT NOT NULL,
+                    deduplication_key TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    profile_version INTEGER NOT NULL,
+                    rubric_version TEXT,
+                    prompt_version TEXT,
+                    assessed_at TEXT NOT NULL,
                     PRIMARY KEY (source, deduplication_key)
                 );
                 """
@@ -109,6 +121,7 @@ class SQLiteJobRepository:
                 "fetch_next_retry_at": "TEXT",
                 "airtable_next_retry_at": "TEXT",
                 "airtable_record_id": "TEXT",
+                "airtable_pending_fields_json": "TEXT NOT NULL DEFAULT '{}'",
                 "airtable_sync_status": "TEXT NOT NULL DEFAULT 'Pending'",
                 "airtable_sync_attempts": "INTEGER NOT NULL DEFAULT 0",
                 "airtable_sync_error": "TEXT",
@@ -117,6 +130,16 @@ class SQLiteJobRepository:
                 if column_name not in processing_columns:
                     connection.execute(
                         f"ALTER TABLE job_processing ADD COLUMN {column_name} {column_definition}"
+                    )
+
+            provenance_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(fit_assessment_provenance)")
+            }
+            for column_name in ("rubric_version", "prompt_version"):
+                if column_name not in provenance_columns:
+                    connection.execute(
+                        f"ALTER TABLE fit_assessment_provenance ADD COLUMN {column_name} TEXT"
                     )
 
             connection.executescript(
@@ -140,14 +163,19 @@ class SQLiteJobRepository:
                 self._migrate_legacy_jobs(connection)
                 connection.execute("DROP TABLE jobs_legacy")
 
-            # A process may have stopped while it owned a fetch.
+            # Recover only claims that have exceeded the lease period. The API
+            # and stdio MCP process may share this database, so a fresh claim
+            # can belong to another live process.
+            stale_before = _stale_processing_cutoff()
             connection.execute(
                 "UPDATE job_processing SET processing_status = 'Pending' "
-                "WHERE processing_status = 'Processing'"
+                "WHERE processing_status = 'Processing' AND updated_at <= ?",
+                (stale_before,),
             )
             connection.execute(
                 "UPDATE job_processing SET airtable_sync_status = 'Pending' "
-                "WHERE airtable_sync_status = 'Processing'"
+                "WHERE airtable_sync_status = 'Processing' AND updated_at <= ?",
+                (stale_before,),
             )
 
     def _migrate_legacy_jobs(self, connection: sqlite3.Connection) -> None:
@@ -258,6 +286,11 @@ class SQLiteJobRepository:
         now = _utc_now()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """UPDATE job_processing SET processing_status = 'Pending', updated_at = ?
+                WHERE processing_status = 'Processing' AND updated_at <= ?""",
+                (now, _stale_processing_cutoff()),
+            )
             row = connection.execute(
                 """SELECT source, deduplication_key, source_job_id FROM job_processing
                 WHERE source = ? AND source_job_id IS NOT NULL
@@ -304,6 +337,11 @@ class SQLiteJobRepository:
         """Claim the next completed job awaiting Airtable insertion or update."""
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """UPDATE job_processing SET airtable_sync_status = 'Pending', updated_at = ?
+                WHERE airtable_sync_status = 'Processing' AND updated_at <= ?""",
+                (_utc_now(), _stale_processing_cutoff()),
+            )
             row = connection.execute(
                 """SELECT p.*, j.* FROM job_processing AS p JOIN jobs AS j
                     USING (source, deduplication_key)
@@ -328,7 +366,7 @@ class SQLiteJobRepository:
                 if key not in {
                     "payload_json", "processing_status", "fetch_attempts", "fetch_error",
                     "fetch_next_retry_at", "airtable_next_retry_at", "airtable_record_id", "airtable_sync_status",
-                    "airtable_sync_attempts", "airtable_sync_error", "created_at", "updated_at",
+                    "airtable_pending_fields_json", "airtable_sync_attempts", "airtable_sync_error", "created_at", "updated_at",
                 }
             }
             return AirtableSyncWorkItem(
@@ -336,19 +374,48 @@ class SQLiteJobRepository:
                 deduplication_key=item["deduplication_key"],
                 airtable_record_id=item["airtable_record_id"],
                 attempts=int(item["airtable_sync_attempts"]) + 1,
+                additional_fields=json.loads(item.get("airtable_pending_fields_json") or "{}"),
                 record=self._row_to_record(mirror_values),
             )
 
     def mark_airtable_synced(
-        self, source: str, deduplication_key: str, record_id: str
+        self,
+        source: str,
+        deduplication_key: str,
+        record_id: str,
+        synced_fields: dict[str, object] | None = None,
     ) -> None:
         with self._connect() as connection:
+            row = connection.execute(
+                "SELECT airtable_pending_fields_json FROM job_processing "
+                "WHERE source = ? AND deduplication_key = ?",
+                (source, deduplication_key),
+            ).fetchone()
+            pending_fields = (
+                json.loads(row["airtable_pending_fields_json"] or "{}")
+                if row
+                else {}
+            )
+            for field_name, value in (synced_fields or {}).items():
+                if pending_fields.get(field_name) == value:
+                    pending_fields.pop(field_name)
+            pending_json = json.dumps(pending_fields, ensure_ascii=False)
+            sync_pending = bool(pending_fields)
             connection.execute(
                 """UPDATE job_processing SET airtable_record_id = ?,
-                    airtable_sync_status = 'Synced', airtable_sync_error = NULL,
-                    processing_status = 'Synced', updated_at = ?
+                    airtable_sync_status = ?, airtable_sync_error = NULL,
+                    airtable_pending_fields_json = ?,
+                    processing_status = ?, airtable_next_retry_at = NULL, updated_at = ?
                 WHERE source = ? AND deduplication_key = ?""",
-                (record_id, _utc_now(), source, deduplication_key),
+                (
+                    record_id,
+                    "Pending" if sync_pending else "Synced",
+                    pending_json,
+                    "ReadyToSync" if sync_pending else "Synced",
+                    _utc_now(),
+                    source,
+                    deduplication_key,
+                ),
             )
 
     def mark_airtable_sync_failed(
@@ -440,19 +507,35 @@ class SQLiteJobRepository:
         return self._row_to_record(dict(row))
 
     def list_jobs(
-        self, *, limit: int, offset: int, source: str | None = None
+        self,
+        *,
+        limit: int,
+        offset: int,
+        source: str | None = None,
+        query: str | None = None,
+        fit_status: str | None = None,
     ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if source:
+            conditions.append("source = ?")
+            parameters.append(source)
+        if fit_status:
+            conditions.append("fit_status = ?")
+            parameters.append(fit_status)
+        if query:
+            conditions.append(
+                "(title LIKE ? OR company LIKE ? OR location LIKE ? OR job_description LIKE ?)"
+            )
+            search_term = f"%{query}%"
+            parameters.extend([search_term] * 4)
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        parameters.extend([limit, offset])
         with self._connect() as connection:
-            if source:
-                rows = connection.execute(
-                    "SELECT * FROM jobs WHERE source = ? ORDER BY posted_at DESC LIMIT ? OFFSET ?",
-                    (source, limit, offset),
-                ).fetchall()
-            else:
-                rows = connection.execute(
-                    "SELECT * FROM jobs ORDER BY posted_at DESC LIMIT ? OFFSET ?",
-                    (limit, offset),
-                ).fetchall()
+            rows = connection.execute(
+                f"SELECT * FROM jobs {where_clause} ORDER BY posted_at DESC LIMIT ? OFFSET ?",
+                parameters,
+            ).fetchall()
             return [self._row_to_record(dict(row)).model_dump(mode="json") for row in rows]
 
     def get_job(self, source_job_id: str) -> dict[str, Any] | None:
@@ -462,6 +545,116 @@ class SQLiteJobRepository:
                 (_SOURCE, source_job_id),
             ).fetchone()
             return self._row_to_record(dict(row)).model_dump(mode="json") if row else None
+
+    def update_job_fields(
+        self,
+        source_job_id: str,
+        fields: dict[str, Any],
+        *,
+        profile_id: str | None = None,
+        profile_version: int | None = None,
+        rubric_version: str | None = None,
+        prompt_version: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Update user-managed job fields and queue their Airtable patch."""
+        allowed_fields = {
+            "application_status",
+            "application_notes",
+            "skill_stack_fit",
+            "semantic_experience_fit",
+            "overall_fit",
+            "fit_category",
+            "fit_explanation",
+            "fit_status",
+        }
+        if not fields or not fields.keys() <= allowed_fields:
+            raise ValueError("Only application and fit fields can be updated.")
+        if (profile_id is None) != (profile_version is None):
+            raise ValueError("Profile ID and version must be supplied together.")
+        if profile_id is not None and (rubric_version is None or prompt_version is None):
+            raise ValueError("Fit updates require rubric and prompt versions.")
+        if profile_id is None and (rubric_version is not None or prompt_version is not None):
+            raise ValueError("Rubric and prompt versions require a profile.")
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM jobs WHERE source = ? AND source_job_id = ?",
+                (_SOURCE, source_job_id),
+            ).fetchone()
+            if row is None:
+                return None
+
+            existing = self._row_to_record(dict(row))
+            updated = JobMirrorRecord.model_validate(
+                {**existing.model_dump(), **fields}
+            )
+            pending_row = connection.execute(
+                "SELECT airtable_pending_fields_json FROM job_processing "
+                "WHERE source = ? AND source_job_id = ?",
+                (_SOURCE, source_job_id),
+            ).fetchone()
+            if pending_row is None:
+                raise RuntimeError(
+                    "Job has no processing row; cannot queue its Airtable update."
+                )
+
+            serialized = updated.model_dump(mode="json")
+            assignments: list[str] = []
+            values: list[Any] = []
+            for name in fields:
+                value = serialized[name]
+                if name == "role_matches":
+                    value = json.dumps(value, ensure_ascii=False)
+                assignments.append(f"{name} = ?")
+                values.append(value)
+            values.extend([_SOURCE, source_job_id])
+            connection.execute(
+                f"UPDATE jobs SET {', '.join(assignments)} "
+                "WHERE source = ? AND source_job_id = ?",
+                values,
+            )
+
+            pending_fields = json.loads(
+                pending_row["airtable_pending_fields_json"] or "{}"
+            )
+            for name in fields:
+                alias = JobMirrorRecord.model_fields[name].alias or name
+                pending_fields[alias] = serialized[name]
+            connection.execute(
+                """UPDATE job_processing SET airtable_pending_fields_json = ?,
+                    processing_status = 'ReadyToSync', airtable_sync_status = 'Pending',
+                    airtable_sync_error = NULL, airtable_next_retry_at = NULL,
+                    updated_at = ? WHERE source = ? AND source_job_id = ?""",
+                (
+                    json.dumps(pending_fields, ensure_ascii=False),
+                    _utc_now(),
+                    _SOURCE,
+                    source_job_id,
+                )
+            )
+            if profile_id is not None and profile_version is not None:
+                connection.execute(
+                    """INSERT INTO fit_assessment_provenance
+                       (source, deduplication_key, profile_id, profile_version,
+                        rubric_version, prompt_version, assessed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(source, deduplication_key) DO UPDATE SET
+                         profile_id = excluded.profile_id,
+                         profile_version = excluded.profile_version,
+                         rubric_version = excluded.rubric_version,
+                         prompt_version = excluded.prompt_version,
+                         assessed_at = excluded.assessed_at""",
+                    (
+                        _SOURCE,
+                        row["deduplication_key"],
+                        profile_id,
+                        profile_version,
+                        rubric_version,
+                        prompt_version,
+                        _utc_now(),
+                    ),
+                )
+            return serialized
 
     @staticmethod
     def _row_to_record(row: dict[str, Any]) -> JobMirrorRecord:
@@ -492,6 +685,12 @@ class SQLiteJobRepository:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _stale_processing_cutoff() -> str:
+    return (
+        datetime.now(timezone.utc) - timedelta(minutes=_STALE_PROCESSING_MINUTES)
+    ).isoformat(timespec="seconds")
 
 
 def _legacy_application_status(value: Any) -> str:
