@@ -8,6 +8,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -98,6 +99,8 @@ class ScoringWorker:
                     prompt_version=PROMPT_VERSION,
                 )
                 result = evaluation.result
+                overall: float | None = None
+                category: str | None = None
                 if result.decision == "needs_review":
                     self.jobs.mark_fit_needs_review(
                         job.source_job_id,
@@ -140,6 +143,11 @@ class ScoringWorker:
                     "scoring_completed",
                     source_job_id=job.source_job_id,
                     status="NeedsReview" if result.decision == "needs_review" else "Scored",
+                    skill_stack_fit=result.skill_stack_fit,
+                    semantic_experience_fit=result.semantic_experience_fit,
+                    overall_fit=overall,
+                    fit_category=category,
+                    review_reason=result.review_reason,
                     evaluation_run_id=evaluation.evaluation_run_id,
                     prompt_tokens=evaluation.response.prompt_tokens,
                     candidate_tokens=evaluation.response.candidate_tokens,
@@ -148,7 +156,7 @@ class ScoringWorker:
                 )
             except Exception as exc:
                 # Model failures have an evaluation record. Persistence errors
-                # leave the job Pending for a later user-triggered retry.
+                # leave the job Pending for a later scoring-loop or CLI retry.
                 summary.failed += 1
                 logger.warning(
                     "scoring_failed",
@@ -160,6 +168,18 @@ class ScoringWorker:
         summary.estimated_cost_usd = self.repository.estimated_batch_cost(summary.batch_id)
         summary.unestimated_calls = self.repository.unestimated_batch_calls(summary.batch_id)
         return summary
+
+
+def scoring_loop(worker: ScoringWorker, stop: Event, poll_seconds: int) -> None:
+    """Score at most one newly eligible job per polling interval."""
+    logger.info("scoring_worker_started", poll_seconds=poll_seconds)
+    while not stop.is_set():
+        try:
+            worker.run(limit=1)
+        except Exception:
+            logger.exception("scoring_worker_iteration_failed")
+        stop.wait(poll_seconds)
+    logger.info("scoring_worker_stopped")
 
 
 def main() -> None:

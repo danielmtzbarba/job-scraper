@@ -76,6 +76,16 @@ curl -F 'file=@.local/dresden-results.html' \
 
 That local `curl` command uploads a file to your local API; it does not request the BA page. The API parses each card and inserts it only when the source/job ID deduplication key is new. New entries start with `Saved` application status and `Pending` fit status.
 
+### Scored jobs UI prototype
+
+The throwaway top-score table has three layout variants and reads scored jobs from Cloud SQL without starting collection or model workers. Run:
+
+```sh
+uv run --cache-dir .local/uv-cache python job_scraper/prototypes/serve_scored_jobs.py
+```
+
+Then open `http://127.0.0.1:8765/prototype/scored-jobs`. Use the bottom switcher or left/right arrow keys to compare layouts. The table shows at most 50 scored jobs, sorted by score by default with posting date as the tie-breaker.
+
 After importing a results page, the background worker queues its jobs for detail enrichment. You can also enrich one staged job with a manually saved detail page:
 
 ```sh
@@ -134,23 +144,17 @@ Once detail enrichment saves a canonical job, it queues classification. An exter
 
 Set the project, location, model, `JOB_SCRAPER_INPUT_PRICE_PER_MILLION`, and `JOB_SCRAPER_OUTPUT_PRICE_PER_MILLION` in the ignored `.env` before enabling the worker. The server does not expose a classification trigger through REST or MCP.
 
-### Triggered Vertex AI scoring
+### Background and triggered Vertex AI scoring
 
-To check the configured Vertex AI project, region, model, and local credentials through the API, start the service and make one synthetic request:
+Set `JOB_SCRAPER_AUTO_SCORE=1` to start a scoring worker in the FastAPI process. Every 15 seconds it claims at most one classified job whose Fit Status is still `Pending`, ordered newest posting first, and scores it with the saved reviewed profile. It uses the same model, project, location, and input/output token prices configured for classification. The worker logs `scoring_completed` with both dimension scores, overall score/category (or review outcome), token counts, evaluation ID, and estimated USD cost. Gemini calls remain off unless this flag is enabled. If both workers are enabled, classification and scoring run independently; only classified jobs are eligible for scoring.
 
-```sh
-curl --fail-with-body -X POST http://127.0.0.1:8000/vertex/smoke-test
-```
-
-The response reports `status`, `project`, `location`, `model`, and token counts. This is a small billed model call; it sends no job description or personal profile and does not read or update jobs. If the model call fails, the endpoint returns HTTP 502 and logs the error type. Restart an API process that was started before this route was added.
-
-The scoring CLI runs only when invoked. Preview the eligible jobs without making model calls:
+The scoring CLI is also available. Preview eligible jobs without making model calls:
 
 ```sh
 uv run --cache-dir .local/uv-cache job-scraper-score --dry-run
 ```
 
-A live run requires the intended GCP project, model, location, Application Default Credentials, enabled Vertex AI access, and current input/output prices for that exact model and location. Confirm the account, billing, region, and budget before using it. Put `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, and `JOB_SCRAPER_VERTEX_MODEL` in the ignored `.env`, then trigger at most ten newest classified, ready-for-scoring jobs:
+A live run requires the intended GCP project, model, location, Application Default Credentials, enabled Vertex AI access, and current input/output prices for that exact model and location. Put `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, and `JOB_SCRAPER_VERTEX_MODEL` in the ignored `.env`, then trigger at most ten newest classified, ready-for-scoring jobs:
 
 ```sh
 uv run --cache-dir .local/uv-cache job-scraper-score \

@@ -13,6 +13,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
+from fastapi.responses import FileResponse
 
 # aiohttp builds its default TLS context during import. Load the local CA path
 # before importing integrations that use it (Cloud SQL in particular).
@@ -31,6 +32,7 @@ from job_scraper.models.jobs import (
     SearchImportResponse,
 )
 from job_scraper.application.classification_worker import ClassificationWorker, classification_loop
+from job_scraper.application.scoring_worker import ScoringWorker, scoring_loop
 from job_scraper.application.jobs import JobService
 from job_scraper.application.model_evaluation import ScoringSettings
 from job_scraper.application.profiles import ProfileStore
@@ -61,20 +63,6 @@ USER_AGENT = (
 BLOCKED_STATUS_CODES = {403, 429, 503}
 
 
-class VertexSmokeReply(BaseModel):
-    ok: bool
-
-
-class VertexSmokeResponse(BaseModel):
-    status: Literal["ok"]
-    project: str
-    location: str
-    model: str
-    prompt_tokens: int | None
-    candidate_tokens: int | None
-    thought_tokens: int | None
-
-
 def _profile_dir() -> Path:
     path = Path(os.getenv("JOB_SCRAPER_PROFILE_DIR", ".local/profiles")).expanduser()
     return path if path.is_absolute() else PROJECT_ROOT / path
@@ -94,6 +82,18 @@ def _detail_fetch_interval() -> int:
 
 def _classification_settings() -> ScoringSettings | None:
     if os.getenv("JOB_SCRAPER_AUTO_CLASSIFY") != "1":
+        return None
+    return ScoringSettings(
+        project_id=os.getenv("GOOGLE_CLOUD_PROJECT", ""),
+        location=os.getenv("GOOGLE_CLOUD_LOCATION", ""),
+        model_id=os.getenv("JOB_SCRAPER_VERTEX_MODEL", ""),
+        input_price_per_million=float(os.getenv("JOB_SCRAPER_INPUT_PRICE_PER_MILLION", "0")),
+        output_price_per_million=float(os.getenv("JOB_SCRAPER_OUTPUT_PRICE_PER_MILLION", "0")),
+    )
+
+
+def _scoring_settings() -> ScoringSettings | None:
+    if os.getenv("JOB_SCRAPER_AUTO_SCORE") != "1":
         return None
     return ScoringSettings(
         project_id=os.getenv("GOOGLE_CLOUD_PROJECT", ""),
@@ -166,6 +166,7 @@ async def lifespan(app: FastAPI):
     app.state.jobs = repository
     app.state.profiles = ProfileStore(_profile_dir())
     classification_settings = _classification_settings()
+    scoring_settings = _scoring_settings()
     app.state.search_tasks = set()
     scheduler_task = asyncio.create_task(
         search_scheduler(repository, fetch_all_search_results, app.state.search_tasks)
@@ -176,6 +177,9 @@ async def lifespan(app: FastAPI):
     classification_task = None
     classification_stop = Event()
     classification_model = None
+    scoring_task = None
+    scoring_stop = Event()
+    scoring_model = None
     if classification_settings:
         classification_model = VertexModelClient(
             project_id=classification_settings.project_id,
@@ -188,6 +192,18 @@ async def lifespan(app: FastAPI):
         classification_task = asyncio.create_task(asyncio.to_thread(
             classification_loop, classifier, classification_stop, 15
         ))
+    if scoring_settings:
+        scoring_model = VertexModelClient(
+            project_id=scoring_settings.project_id,
+            location=scoring_settings.location,
+            model_id=scoring_settings.model_id,
+        )
+        scorer = ScoringWorker(
+            repository, app.state.profiles, scoring_model, scoring_settings
+        )
+        scoring_task = asyncio.create_task(asyncio.to_thread(
+            scoring_loop, scorer, scoring_stop, 15
+        ))
     try:
         async with mcp_server.session_manager.run():
             yield
@@ -197,6 +213,7 @@ async def lifespan(app: FastAPI):
             task.cancel()
         worker_task.cancel()
         classification_stop.set()
+        scoring_stop.set()
         try:
             await scheduler_task
         except asyncio.CancelledError:
@@ -209,8 +226,12 @@ async def lifespan(app: FastAPI):
             pass
         if classification_task:
             await classification_task
+        if scoring_task:
+            await scoring_task
         if classification_model:
             classification_model.close()
+        if scoring_model:
+            scoring_model.close()
         if hasattr(repository, "close"):
             repository.close()
         logger.info("api_shutdown_complete")
@@ -310,43 +331,12 @@ def health() -> dict[str, str]:
     return {"status": "ok", "storage": os.getenv("JOB_SCRAPER_STORAGE", "sqlite")}
 
 
-@app.post("/vertex/smoke-test", response_model=VertexSmokeResponse)
-def vertex_smoke_test() -> VertexSmokeResponse:
-    """Make one synthetic Vertex call without reading or changing job data."""
-    project = os.getenv("GOOGLE_CLOUD_PROJECT", "")
-    location = os.getenv("GOOGLE_CLOUD_LOCATION", "")
-    model = os.getenv("JOB_SCRAPER_VERTEX_MODEL", "")
-    if not all((project, location, model)):
-        raise HTTPException(status_code=503, detail="Vertex AI project, location, and model must be configured.")
-
-    client = None
-    try:
-        client = VertexModelClient(project_id=project, location=location, model_id=model)
-        response = client.generate(
-            'Synthetic connectivity test. Return {"ok": true}.',
-            VertexSmokeReply,
-        )
-        if not VertexSmokeReply.model_validate_json(response.text or "").ok:
-            raise ValueError("Vertex AI did not confirm the smoke test")
-    except Exception as exc:
-        logger.exception("vertex_smoke_test_failed", error_type=type(exc).__name__)
-        raise HTTPException(
-            status_code=502,
-            detail=f"Vertex AI smoke test failed ({type(exc).__name__}); check server logs.",
-        ) from exc
-    finally:
-        if client is not None:
-            client.close()
-
-    return VertexSmokeResponse(
-        status="ok",
-        project=project,
-        location=location,
-        model=model,
-        prompt_tokens=response.prompt_tokens,
-        candidate_tokens=response.candidate_tokens,
-        thought_tokens=response.thought_tokens,
-    )
+@app.get("/prototype/scored-jobs", include_in_schema=False)
+def scored_jobs_prototype() -> FileResponse:
+    """Throwaway UI prototype: compare three layouts for the top scored jobs."""
+    if os.getenv("K_SERVICE"):
+        raise HTTPException(status_code=404, detail="Prototype route is local only.")
+    return FileResponse(PROJECT_ROOT / "job_scraper" / "prototypes" / "scored_jobs.html")
 
 
 @app.get("/searches")
@@ -531,8 +521,11 @@ def list_jobs(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     source: str | None = None,
+    fit_status: str | None = None,
 ) -> dict[str, Any]:
-    jobs = _repository(request).list_jobs(limit=limit, offset=offset, source=source)
+    jobs = _repository(request).list_jobs(
+        limit=limit, offset=offset, source=source, fit_status=fit_status
+    )
     return {"count": len(jobs), "limit": limit, "offset": offset, "jobs": jobs}
 
 
