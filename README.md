@@ -14,10 +14,11 @@ The local HTML parser uses Beautiful Soup (`beautifulsoup4`), managed through `u
 
 ```sh
 uv sync --cache-dir .local/uv-cache
+uv run --cache-dir .local/uv-cache playwright install chromium
 uv run --cache-dir .local/uv-cache python main.py
 ```
 
-`uv sync` creates the project environment and lockfile. The repository-local cache path keeps setup self-contained. Keep any local secrets in `.env` and private profile/CV files under ignored local paths. Never commit credentials or personal CV data.
+`uv sync` creates the project environment and lockfile. Playwright installs Chromium separately in its browser cache so the BA collector can load every result page. The repository-local uv cache keeps Python dependency downloads under `.local`. Keep any local secrets in `.env` and private profile/CV files under ignored local paths. Never commit credentials or personal CV data.
 
 ## Local FastAPI import service
 
@@ -41,7 +42,7 @@ curl -F 'file=@.local/dresden-results.html' \
   http://127.0.0.1:8000/imports/search-results
 ```
 
-That local `curl` command uploads a file to your local API; it does not request the BA page. The API parses each card and upserts it into SQLite using the source/job ID deduplication key. New entries start with `Saved` application status and `Pending` fit status.
+That local `curl` command uploads a file to your local API; it does not request the BA page. The API parses each card and inserts it into SQLite only when the source/job ID deduplication key is new. New entries start with `Saved` application status and `Pending` fit status.
 
 After importing a results page, the background worker queues its jobs for detail enrichment. You can also enrich one staged job with a manually saved detail page:
 
@@ -51,8 +52,18 @@ curl -F 'file=@.local/symate-detail.html' \
   http://127.0.0.1:8000/jobs/11956-3034291790978401-S/detail
 ```
 
-Inspect completed local job rows at `GET /jobs` or `GET /jobs/{source_job_id}`. Re-importing updates known source fields without replacing application or fit statuses. SQLite has two application tables: `job_processing` stores a Pydantic-validated JSON payload and fetch/sync state; `jobs` mirrors the Airtable `Jobs` data fields and contains only publishable job records. Successful detail parsing moves a job into `jobs` and marks it `ReadyToSync`; the Airtable sync worker then creates or updates the matching record and marks it `Synced`. Airtable-managed application status, notes, and scoring fields are preserved when updating an existing row. Failed Airtable requests retry with exponential backoff, up to eight attempts.
+Inspect completed local job rows at `GET /jobs` or `GET /jobs/{source_job_id}`. Re-importing a known search result leaves its existing source and application fields untouched. SQLite has two application tables: `job_processing` stores a Pydantic-validated JSON payload and fetch/sync state; `jobs` mirrors the Airtable `Jobs` data fields and contains only publishable job records. Successful detail parsing moves a job into `jobs` and marks it `ReadyToSync`; the Airtable sync worker then creates or updates the matching record and marks it `Synced`. Airtable-managed application status, notes, and scoring fields are preserved when updating an existing row. Failed Airtable requests retry with exponential backoff, up to eight attempts.
 
+
+### Scheduled Agentur für Arbeit searches
+
+While the local API is running, ten keyword searches start every day at 07:00, 07:15, ..., 09:15 Europe/Berlin. A search starts on time even if an earlier one is still running. The search definitions and their BA URLs are in `job_scraper/application/search_schedule.py`. Missed slots are not backfilled when the API starts later in the day.
+
+Use `GET /searches` to inspect the schedule, `POST /searches/{search_id}/run` to start one search immediately, and `GET /search-runs` to inspect its outcome. Each search inserts only source posting IDs that are new to SQLite; known postings are ignored without recording another appearance. There is no daily result cap. New BA postings enter the existing detail and Airtable workers. Explicit contract and freelance postings are filtered after detail parsing.
+
+The BA search collector uses Chromium to load all results behind “Weitere Ergebnisse”, then parses the rendered HTML. It sorts by newest publication. The sort parameter and `Deutschland (Land)` location were checked against BA's rendered search UI; a read-only local browser check parsed all 206 results for one Python Entwickler query. Search runs fail rather than silently truncating results if pagination cannot complete. Run outcomes are kept locally in SQLite; no tracker or Airtable write was made during that browser check.
+
+For future sources, the local `source_aliases` table links a source posting to one canonical tracker job. Automatic linking requires a shared direct application URL, matching employer and title, and closely matching full descriptions. Similar postings with uncertain identity are held before Airtable sync. Inspect every possible match with `GET /duplicate-reviews`, then use `POST /duplicate-reviews/{source}/{deduplication_key}/resolve` with `{"decision":"link_existing","possible_source":"Agentur für Arbeit","possible_key":"arbeitsagentur:BA-123"}` or `{"decision":"keep_separate"}`. Specify the match identity when more than one is listed. Source and key path segments must be URL-encoded. Search-result uploads and direct fetches are insert-only; detail imports enrich only pending postings.
 
 ## Local MCP server
 
@@ -83,7 +94,7 @@ Available tools:
 
 FastAPI starts one Airtable sync worker when `AIRTABLE_TOKEN` is configured. The standalone stdio server starts its own worker if run separately. Local Streamable HTTP is available now; remote hosting and personal-account authentication are deferred until the GCP deployment phase.
 
-The versioned rubric and prompt are defined in `job_scraper/application/scoring_prompt.py`. Skill/stack fit assigns up to 70 points to required skills, 20 to preferred skills, and 10 to evidence of using the stack together. Experience fit assigns up to 60 points to direct responsibilities, 25 to comparable delivery and ownership, and 15 to transferable adjacent work. Overall categories are Strong (85–100), Good (70–<85), Stretch (50–<70), and Low (<50). If the JD lacks essential information, the assistant uses `mark_fit_needs_review` instead of inventing scores. The prompt tells the assistant to treat JD and profile content as data, cite evidence IDs, and report key gaps. The local server does not call Gemini automatically.
+The versioned rubric and prompt are defined in `job_scraper/application/scoring_prompt.py`. Rubric/prompt v2.1.0 gives direct credit for demonstrated engineering capabilities on functionally equivalent tools, reserving a smaller deduction for required platform-specific operation. A named-tool gap is not deducted again from semantic experience. Language and education are excluded from both fit scores; the user's German-language and education/degree/grade requirements are treated as met and are not reported as gaps. The 70/20/10 skill and 60/25/15 experience subweights, 50/50 overall average, and category boundaries remain the same. Rubrics v1.0.0 and v2.0.0 remain in the source for comparison; existing scores are not changed automatically. If the JD lacks essential information, the assistant uses `mark_fit_needs_review` instead of inventing scores. The prompt treats JD and profile content as data, cites evidence IDs, and reports key gaps. The local server does not call Gemini automatically.
 
 ### Private career profiles
 

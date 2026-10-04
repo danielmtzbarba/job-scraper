@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import ValidationError
 
@@ -107,8 +110,55 @@ class SQLiteJobRepository:
                     assessed_at TEXT NOT NULL,
                     PRIMARY KEY (source, deduplication_key)
                 );
+                CREATE TABLE IF NOT EXISTS source_aliases (
+                    source TEXT NOT NULL,
+                    deduplication_key TEXT NOT NULL,
+                    canonical_source TEXT NOT NULL,
+                    canonical_key TEXT NOT NULL,
+                    PRIMARY KEY (source, deduplication_key)
+                );
+                CREATE TABLE IF NOT EXISTS possible_duplicates (
+                    source TEXT NOT NULL,
+                    deduplication_key TEXT NOT NULL,
+                    possible_source TEXT NOT NULL,
+                    possible_key TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (source, deduplication_key, possible_source, possible_key)
+                );
+                CREATE TABLE IF NOT EXISTS search_runs (
+                    id TEXT PRIMARY KEY,
+                    search_id TEXT NOT NULL,
+                    slot_date TEXT,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    status TEXT NOT NULL,
+                    found INTEGER NOT NULL DEFAULT 0,
+                    inserted INTEGER NOT NULL DEFAULT 0,
+                    duplicate INTEGER NOT NULL DEFAULT 0,
+                    skipped INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    UNIQUE (search_id, slot_date)
+                );
                 """
             )
+
+            duplicate_pk = [
+                row[1] for row in connection.execute("PRAGMA table_info(possible_duplicates)")
+                if row[5]
+            ]
+            if duplicate_pk == ["source", "deduplication_key"]:
+                connection.executescript(
+                    """ALTER TABLE possible_duplicates RENAME TO possible_duplicates_old;
+                    CREATE TABLE possible_duplicates (
+                        source TEXT NOT NULL, deduplication_key TEXT NOT NULL,
+                        possible_source TEXT NOT NULL, possible_key TEXT NOT NULL,
+                        reason TEXT NOT NULL, created_at TEXT NOT NULL,
+                        PRIMARY KEY (source, deduplication_key, possible_source, possible_key)
+                    );
+                    INSERT INTO possible_duplicates SELECT * FROM possible_duplicates_old;
+                    DROP TABLE possible_duplicates_old;"""
+                )
 
             # CREATE TABLE IF NOT EXISTS does not update an existing database.
             # Add columns introduced after the original staging schema before
@@ -150,6 +200,8 @@ class SQLiteJobRepository:
                     ON job_processing (processing_status, airtable_sync_status, airtable_next_retry_at);
                 CREATE INDEX IF NOT EXISTS idx_jobs_source_job_id
                     ON jobs (source, source_job_id);
+                CREATE INDEX IF NOT EXISTS idx_jobs_company_title
+                    ON jobs (company, title);
                 """
             )
 
@@ -162,6 +214,12 @@ class SQLiteJobRepository:
             if "jobs_legacy" in tables:
                 self._migrate_legacy_jobs(connection)
                 connection.execute("DROP TABLE jobs_legacy")
+
+            connection.execute(
+                """INSERT OR IGNORE INTO source_aliases
+                   (source, deduplication_key, canonical_source, canonical_key)
+                   SELECT source, deduplication_key, source, deduplication_key FROM jobs"""
+            )
 
             # Recover only claims that have exceeded the lease period. The API
             # and stdio MCP process may share this database, so a fresh claim
@@ -234,52 +292,66 @@ class SQLiteJobRepository:
             if processing_status == "ReadyToSync":
                 self._upsert_mirror(connection, payload.to_mirror_record())
 
-    def upsert_search_results(self, postings: list[JobPosting]) -> dict[str, int]:
-        inserted = updated = skipped = 0
+    def stage_new_search_results(
+        self, postings: list[JobPosting], *, search_run_id: str | None = None
+    ) -> dict[str, int]:
+        """Insert only unseen source postings, safely across concurrent searches."""
+        inserted = duplicate = skipped = 0
         now = _utc_now()
         with self._connect() as connection:
             for posting in postings:
                 key = posting.deduplication_key
-                if not key:
+                if not key or not posting.source_job_id:
                     skipped += 1
                     continue
-                incoming = JobProcessingPayload.from_posting(posting)
-                row = connection.execute(
-                    "SELECT * FROM job_processing WHERE source = ? AND deduplication_key = ?",
-                    (posting.source, key),
-                ).fetchone()
-                if row is None:
-                    connection.execute(
-                        """INSERT INTO job_processing (
-                            source, deduplication_key, source_job_id, payload_json,
-                            processing_status, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, 'Pending', ?, ?)""",
-                        (posting.source, key, posting.source_job_id, incoming.model_dump_json(), now, now),
-                    )
-                    inserted += 1
-                    continue
-
-                previous = JobProcessingPayload.model_validate_json(row["payload_json"])
-                merged_values = previous.model_dump()
-                for name, value in incoming.model_dump().items():
-                    if value is not None and value != []:
-                        merged_values[name] = value
-                merged = JobProcessingPayload.model_validate(merged_values)
-                connection.execute(
-                    "UPDATE job_processing SET source_job_id = ?, payload_json = ?, updated_at = ? "
-                    "WHERE source = ? AND deduplication_key = ?",
-                    (merged.source_job_id, merged.model_dump_json(), now, posting.source, key),
+                payload = JobProcessingPayload.from_posting(posting)
+                payload.search_run_id = search_run_id
+                cursor = connection.execute(
+                    """INSERT INTO job_processing
+                       (source, deduplication_key, source_job_id, payload_json,
+                        processing_status, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, 'Pending', ?, ?)
+                       ON CONFLICT(source, deduplication_key) DO NOTHING""",
+                    (posting.source, key, posting.source_job_id, payload.model_dump_json(), now, now),
                 )
-                if row["processing_status"] in {"ReadyToSync", "Synced"}:
-                    self._upsert_mirror(connection, merged.to_mirror_record())
-                    connection.execute(
-                        """UPDATE job_processing SET processing_status = 'ReadyToSync',
-                            airtable_sync_status = 'Pending', airtable_sync_error = NULL,
-                            updated_at = ? WHERE source = ? AND deduplication_key = ?""",
-                        (now, posting.source, key),
-                    )
-                updated += 1
-        return {"inserted": inserted, "updated": updated, "skipped": skipped}
+                if cursor.rowcount:
+                    inserted += 1
+                else:
+                    duplicate += 1
+        return {"inserted": inserted, "duplicate": duplicate, "skipped": skipped}
+
+    def start_search_run(self, run_id: str, search_id: str, slot_date: str | None) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO search_runs (id, search_id, slot_date, started_at, status)
+                   VALUES (?, ?, ?, ?, 'Running')
+                   ON CONFLICT(search_id, slot_date) DO NOTHING""",
+                (run_id, search_id, slot_date, _utc_now()),
+            )
+            return bool(cursor.rowcount)
+
+    def finish_search_run(
+        self, run_id: str, *, counts: dict[str, int] | None = None,
+        error: str | None = None, partial: bool = False,
+    ) -> None:
+        counts = counts or {}
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE search_runs SET finished_at = ?, status = ?, found = ?,
+                   inserted = ?, duplicate = ?, skipped = ?, error = ? WHERE id = ?""",
+                (
+                    _utc_now(), "Failed" if error else "Partial" if partial else "Completed",
+                    counts.get("found", 0), counts.get("inserted", 0),
+                    counts.get("duplicate", 0), counts.get("skipped", 0),
+                    error[:1000] if error else None, run_id,
+                ),
+            )
+
+    def list_search_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            return [dict(row) for row in connection.execute(
+                "SELECT * FROM search_runs ORDER BY started_at DESC, rowid DESC LIMIT ?", (limit,)
+            )]
 
     def claim_next_detail_job(self) -> str | None:
         """Claim the next BA staging row awaiting detail enrichment."""
@@ -448,12 +520,24 @@ class SQLiteJobRepository:
         self, source_job_id: str, detail: JobPosting
     ) -> dict[str, Any] | None:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT * FROM job_processing WHERE source = ? AND source_job_id = ?",
                 (detail.source, source_job_id),
             ).fetchone()
             if row is None:
                 return None
+
+            if row["processing_status"] not in {"Pending", "Processing"}:
+                existing = connection.execute(
+                    "SELECT * FROM jobs WHERE source = ? AND deduplication_key = ?",
+                    (detail.source, row["deduplication_key"]),
+                ).fetchone()
+                if existing is not None:
+                    return self._row_to_record(dict(existing)).model_dump(mode="json")
+                return JobProcessingPayload.model_validate_json(
+                    row["payload_json"]
+                ).to_mirror_record().model_dump(mode="json")
 
             staged = JobProcessingPayload.model_validate_json(row["payload_json"])
             detail_payload = JobProcessingPayload.from_posting(detail)
@@ -462,7 +546,58 @@ class SQLiteJobRepository:
                 if value is not None and value != []:
                     values[name] = value
             merged = JobProcessingPayload.model_validate(values)
+            candidate = merged.to_mirror_record()
+            existing_job = connection.execute(
+                "SELECT 1 FROM jobs WHERE source = ? AND deduplication_key = ?",
+                (detail.source, staged.deduplication_key),
+            ).fetchone()
+            if existing_job is None and _excluded_employment(merged):
+                connection.execute(
+                    """UPDATE job_processing SET payload_json = ?,
+                       processing_status = 'Filtered', updated_at = ?
+                       WHERE source = ? AND deduplication_key = ?""",
+                    (merged.model_dump_json(), _utc_now(), detail.source, staged.deduplication_key),
+                )
+                return candidate.model_dump(mode="json")
+            if existing_job is None:
+                exact, possible = self._cross_source_matches(connection, candidate)
+                if exact is not None and not possible:
+                    connection.execute(
+                        """INSERT OR REPLACE INTO source_aliases
+                           (source, deduplication_key, canonical_source, canonical_key)
+                           VALUES (?, ?, ?, ?)""",
+                        (detail.source, staged.deduplication_key, exact["source"], exact["deduplication_key"]),
+                    )
+                    connection.execute(
+                        """UPDATE job_processing SET payload_json = ?,
+                           processing_status = 'Merged', updated_at = ?
+                           WHERE source = ? AND deduplication_key = ?""",
+                        (merged.model_dump_json(), _utc_now(), detail.source, staged.deduplication_key),
+                    )
+                    return candidate.model_dump(mode="json")
+                if possible:
+                    for match in possible:
+                        connection.execute(
+                            """INSERT OR IGNORE INTO possible_duplicates
+                               (source, deduplication_key, possible_source, possible_key,
+                                reason, created_at) VALUES (?, ?, ?, ?, ?, ?)""",
+                            (detail.source, staged.deduplication_key, match["source"],
+                             match["deduplication_key"], match["reason"], _utc_now()),
+                        )
+                    connection.execute(
+                        """UPDATE job_processing SET payload_json = ?,
+                           processing_status = 'NeedsReview', updated_at = ?
+                           WHERE source = ? AND deduplication_key = ?""",
+                        (merged.model_dump_json(), _utc_now(), detail.source, staged.deduplication_key),
+                    )
+                    return candidate.model_dump(mode="json")
             mirror = self._upsert_mirror(connection, merged.to_mirror_record())
+            connection.execute(
+                """INSERT OR IGNORE INTO source_aliases
+                   (source, deduplication_key, canonical_source, canonical_key)
+                   VALUES (?, ?, ?, ?)""",
+                (detail.source, staged.deduplication_key, detail.source, staged.deduplication_key),
+            )
             now = _utc_now()
             connection.execute(
                 """UPDATE job_processing SET payload_json = ?,
@@ -472,6 +607,131 @@ class SQLiteJobRepository:
                 (merged.model_dump_json(), now, detail.source, staged.deduplication_key),
             )
             return mirror.model_dump(mode="json")
+
+    def get_processing_status(self, source: str, source_job_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT processing_status FROM job_processing WHERE source = ? AND source_job_id = ?",
+                (source, source_job_id),
+            ).fetchone()
+            return str(row["processing_status"]) if row else None
+
+    def _cross_source_matches(
+        self, connection: sqlite3.Connection, candidate: JobMirrorRecord
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """Auto-link only a shared direct URL with matching employer, title and JD."""
+        rows = [dict(row) for row in connection.execute(
+            "SELECT source, deduplication_key, title, company, application_url, job_description "
+            "FROM jobs WHERE source <> ?", (candidate.source,)
+        )]
+        candidate_url = _direct_application_url(candidate.application_url)
+        exact = [row for row in rows if candidate_url and
+                 _direct_application_url(row["application_url"]) == candidate_url]
+        possible: list[dict[str, Any]] = []
+        if len(exact) == 1:
+            same_company = _normalized_text(candidate.company) == _normalized_text(exact[0]["company"])
+            title_similarity = SequenceMatcher(
+                None, _normalized_text(candidate.title), _normalized_text(exact[0]["title"])
+            ).ratio()
+            description = _normalized_text(candidate.job_description)
+            other_description = _normalized_text(exact[0]["job_description"])
+            description_similarity = (
+                SequenceMatcher(None, description, other_description).ratio()
+                if min(len(description), len(other_description)) >= 80 else 0
+            )
+            if same_company and candidate.company and title_similarity >= 0.86 and description_similarity >= 0.9:
+                return exact[0], []
+        for row in exact:
+            possible.append({**row, "reason": "Shared application URL; verify job descriptions"})
+        company = _normalized_text(candidate.company)
+        title = _normalized_text(candidate.title)
+        if company and title:
+            for row in rows:
+                if row in exact:
+                    continue
+                if _normalized_text(row["company"]) != company:
+                    continue
+                other_title = _normalized_text(row["title"])
+                if other_title and SequenceMatcher(None, title, other_title).ratio() >= 0.86:
+                    possible.append({**row, "reason": "Similar employer and title"})
+        return None, possible
+
+    def list_possible_duplicates(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT d.source, d.deduplication_key, d.possible_source,
+                   d.possible_key, d.reason, d.created_at, p.payload_json,
+                   j.title AS possible_title, j.company AS possible_company,
+                   j.job_url AS possible_job_url
+                   FROM possible_duplicates d
+                   JOIN job_processing p USING (source, deduplication_key)
+                   JOIN jobs j ON j.source = d.possible_source
+                              AND j.deduplication_key = d.possible_key
+                   ORDER BY d.created_at"""
+            ).fetchall()
+            results = []
+            for row in rows:
+                item = dict(row)
+                item["candidate"] = json.loads(item.pop("payload_json"))
+                results.append(item)
+            return results
+
+    def resolve_possible_duplicate(
+        self, source: str, deduplication_key: str, *, link_existing: bool,
+        possible_source: str | None = None, possible_key: str | None = None,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT p.payload_json, d.possible_source, d.possible_key
+                   FROM possible_duplicates d JOIN job_processing p
+                   USING (source, deduplication_key)
+                   WHERE d.source = ? AND d.deduplication_key = ?
+                     AND p.processing_status = 'NeedsReview'""",
+                (source, deduplication_key),
+            ).fetchall()
+            if not row:
+                return None
+            if link_existing:
+                matches = [item for item in row if
+                           (possible_source is None or item["possible_source"] == possible_source)
+                           and (possible_key is None or item["possible_key"] == possible_key)]
+                if len(matches) != 1:
+                    raise ValueError("Select exactly one possible_source and possible_key.")
+                selected = matches[0]
+            else:
+                selected = row[0]
+            payload = JobProcessingPayload.model_validate_json(selected["payload_json"])
+            if link_existing:
+                canonical = connection.execute(
+                    "SELECT * FROM jobs WHERE source = ? AND deduplication_key = ?",
+                    (selected["possible_source"], selected["possible_key"]),
+                ).fetchone()
+                if canonical is None:
+                    raise LookupError("The possible matching job no longer exists.")
+                result = self._row_to_record(dict(canonical)).model_dump(mode="json")
+                status = "Merged"
+                canonical_source, canonical_key = selected["possible_source"], selected["possible_key"]
+            else:
+                result = self._upsert_mirror(connection, payload.to_mirror_record()).model_dump(mode="json")
+                status = "ReadyToSync"
+                canonical_source, canonical_key = source, deduplication_key
+            connection.execute(
+                """INSERT OR REPLACE INTO source_aliases
+                   (source, deduplication_key, canonical_source, canonical_key)
+                   VALUES (?, ?, ?, ?)""",
+                (source, deduplication_key, canonical_source, canonical_key),
+            )
+            connection.execute(
+                "UPDATE job_processing SET processing_status = ?, updated_at = ? "
+                "WHERE source = ? AND deduplication_key = ?",
+                (status, _utc_now(), source, deduplication_key),
+            )
+            connection.execute(
+                "DELETE FROM possible_duplicates WHERE source = ? AND deduplication_key = ?",
+                (source, deduplication_key),
+            )
+            return {"resolution": "linked" if link_existing else "separate", "job": result}
 
     def _upsert_mirror(
         self,
@@ -685,6 +945,33 @@ class SQLiteJobRepository:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _normalized_text(value: str | None) -> str:
+    return " ".join(re.findall(r"[\w]+", (value or "").casefold()))
+
+
+def _excluded_employment(payload: JobProcessingPayload) -> bool:
+    if payload.employment_type in {"Contract", "Freelance"}:
+        return True
+    details = (payload.employment_type_text or "").casefold()
+    return any(term in details for term in ("minijob", "werkstudent", "praktikum", "trainee"))
+
+
+def _direct_application_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    parts = urlsplit(value)
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        return None
+    path = parts.path.rstrip("/").lower()
+    if path in {"", "/jobs", "/job", "/careers", "/career", "/karriere", "/stellenangebote"}:
+        return None
+    query = urlencode([
+        (key, item) for key, item in parse_qsl(parts.query)
+        if not key.lower().startswith("utm_") and key.lower() not in {"fbclid", "gclid"}
+    ])
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, query, ""))
 
 
 def _stale_processing_cutoff() -> str:

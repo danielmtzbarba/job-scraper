@@ -8,12 +8,14 @@ import random
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 import httpx
 from curl_cffi.requests import AsyncSession
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from pydantic import BaseModel
 
 from job_scraper.models.jobs import (
     JobDetailResponse,
@@ -25,9 +27,13 @@ from job_scraper.models.jobs import (
 from job_scraper.application.airtable_sync import airtable_sync_worker
 from job_scraper.application.jobs import JobService
 from job_scraper.application.profiles import ProfileStore
+from job_scraper.application.search_schedule import (
+    SEARCH_BY_ID, SEARCHES, claim_search, execute_search, search_scheduler,
+)
 from job_scraper.integrations.airtable import AirtableSettings
 from job_scraper.mcp.server import ServerContext, create_server
 from job_scraper.sources.arbeitsagentur.html_parser import JobPosting, parse_html
+from job_scraper.sources.arbeitsagentur.browser import fetch_all_search_results
 from job_scraper.logging_config import setup_logging
 from job_scraper.storage.sqlite_jobs import SQLiteJobRepository
 
@@ -92,11 +98,14 @@ async def detail_fetcher_cron(
                     updated = repository.enrich_from_detail(job_id, detail)
                     if updated is None:
                         raise LookupError(f"Job {job_id} no longer exists in the repository")
-                    logger.info("detail_fetch_completed", source_job_id=job_id)
+                    logger.info(
+                        "detail_fetch_completed", source_job_id=job_id,
+                        processing_status=repository.get_processing_status(SOURCE_NAME, job_id),
+                    )
                 except asyncio.CancelledError:
                     repository.update_processing_status(job_id, "Pending")
                     raise
-                except Exception:
+                except Exception as exc:
                     attempts = repository.get_fetch_attempts(job_id)
                     next_status = "Pending" if attempts < 3 else "Failed"
                     repository.update_processing_status(job_id, next_status, str(exc))
@@ -124,6 +133,10 @@ async def lifespan(app: FastAPI):
     repository.initialize()
     app.state.jobs = repository
     app.state.profiles = ProfileStore(_profile_dir())
+    app.state.search_tasks = set()
+    scheduler_task = asyncio.create_task(
+        search_scheduler(repository, fetch_all_search_results, app.state.search_tasks)
+    )
     worker_task = asyncio.create_task(
         detail_fetcher_cron(repository, interval_seconds=_detail_fetch_interval())
     )
@@ -139,9 +152,18 @@ async def lifespan(app: FastAPI):
         async with mcp_server.session_manager.run():
             yield
     finally:
+        scheduler_task.cancel()
+        for task in app.state.search_tasks:
+            task.cancel()
         worker_task.cancel()
         if airtable_task:
             airtable_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
+        if app.state.search_tasks:
+            await asyncio.gather(*app.state.search_tasks, return_exceptions=True)
         try:
             await worker_task
         except asyncio.CancelledError:
@@ -189,9 +211,10 @@ async def _read_html(file: UploadFile) -> str:
 
 async def _fetch_html_smart(url: str) -> str:
     """Fetch HTML using httpx, falling back to curl_cffi if blocked by a WAF."""
+    _validate_ba_url(url)
     try:
         headers = {"User-Agent": USER_AGENT}
-        async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=8.0) as client:
             response = await client.get(url, headers=headers)
 
             if response.status_code in BLOCKED_STATUS_CODES:
@@ -202,6 +225,8 @@ async def _fetch_html_smart(url: str) -> str:
                 )
 
             response.raise_for_status()
+            if response.status_code >= 300:
+                raise HTTPException(status_code=502, detail="Unexpected redirect from BA Jobsuche.")
             return response.text
 
     except (httpx.HTTPStatusError, httpx.RequestError) as exc:
@@ -212,11 +237,11 @@ async def _fetch_html_smart(url: str) -> str:
 
         try:
             async with AsyncSession(impersonate="chrome120") as session:
-                response = await session.get(url, timeout=10)
-                if response.status_code >= 400:
+                response = await session.get(url, timeout=10, allow_redirects=False)
+                if response.status_code >= 300:
                     raise HTTPException(
                         status_code=response.status_code,
-                        detail=f"curl_cffi failed to bypass blocking (Status: {response.status_code})"
+                        detail=f"BA Jobsuche returned status {response.status_code}"
                     )
                 return response.text
         except Exception as fallback_exc:
@@ -226,13 +251,76 @@ async def _fetch_html_smart(url: str) -> str:
             )
             raise HTTPException(
                 status_code=502,
-                detail=f"Both standard fetch and TLS impersonation fallback failed: {fallback_exc}"
-            )
+                detail=f"Both BA fetch methods failed: {type(fallback_exc).__name__}"
+            ) from fallback_exc
+
+
+def _validate_ba_url(url: str) -> None:
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "https" or parsed.hostname != "www.arbeitsagentur.de"
+        or parsed.port not in {None, 443} or parsed.username or parsed.password
+        or not parsed.path.startswith("/jobsuche/")
+    ):
+        raise HTTPException(status_code=422, detail="Only HTTPS Arbeitsagentur Jobsuche URLs are accepted.")
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "storage": "sqlite"}
+
+
+@app.get("/searches")
+def list_searches() -> list[dict[str, object]]:
+    return [search.public_dict() for search in SEARCHES]
+
+
+@app.get("/search-runs")
+def list_search_runs(request: Request, limit: int = Query(default=50, ge=1, le=200)) -> list[dict[str, Any]]:
+    return _repository(request).list_search_runs(limit)
+
+
+@app.post("/searches/{search_id}/run", status_code=202)
+async def run_search_now(search_id: str, request: Request) -> dict[str, str]:
+    search = SEARCH_BY_ID.get(search_id)
+    if search is None:
+        raise HTTPException(status_code=404, detail="Search not found.")
+    run_id = claim_search(_repository(request), search, None)
+    if run_id is None:
+        raise HTTPException(status_code=409, detail="Search run could not be started.")
+    task = asyncio.create_task(execute_search(_repository(request), search, run_id, fetch_all_search_results))
+    request.app.state.search_tasks.add(task)
+    task.add_done_callback(request.app.state.search_tasks.discard)
+    return {"run_id": run_id, "status": "Running"}
+
+
+class DuplicateResolution(BaseModel):
+    decision: Literal["link_existing", "keep_separate"]
+    possible_source: str | None = None
+    possible_key: str | None = None
+
+
+@app.get("/duplicate-reviews")
+def list_duplicate_reviews(request: Request) -> list[dict[str, Any]]:
+    return _repository(request).list_possible_duplicates()
+
+
+@app.post("/duplicate-reviews/{source}/{deduplication_key:path}/resolve")
+def resolve_duplicate_review(
+    source: str, deduplication_key: str, decision: DuplicateResolution, request: Request
+) -> dict[str, Any]:
+    try:
+        resolved = _repository(request).resolve_possible_duplicate(
+            source, deduplication_key,
+            link_existing=decision.decision == "link_existing",
+            possible_source=decision.possible_source,
+            possible_key=decision.possible_key,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Duplicate review not found.")
+    return resolved
 
 
 # --- Existing Upload Endpoints ---
@@ -243,16 +331,17 @@ async def import_search_results(
     file: UploadFile = File(...),
     source_url: str | None = Form(default=None),
 ) -> dict[str, Any]:
-    """Parse a supplied results page and upsert its job cards into SQLite."""
+    """Parse a supplied results page and stage only new source postings."""
     html = await _read_html(file)
     postings = parse_html(html, source_url=source_url)
     if not postings:
         raise HTTPException(status_code=422, detail="No job postings were found in the HTML.")
 
-    counts = _repository(request).upsert_search_results(postings)
+    counts = _repository(request).stage_new_search_results(postings)
     return {
         "found": len(postings),
         **counts,
+        "updated": 0,
         "jobs": [_job_summary(posting) for posting in postings],
     }
 
@@ -289,7 +378,10 @@ async def import_job_detail(
             status_code=404,
             detail="Import this job's search-results page before adding its detail page.",
         )
-    return {"updated": True, "job": updated}
+    return {
+        "updated": True, "job": updated,
+        "processing_status": _repository(request).get_processing_status(SOURCE_NAME, source_job_id),
+    }
 
 
 # --- New Smart Fetch Endpoints ---
@@ -299,16 +391,17 @@ async def fetch_and_import_search_results(
     request: Request,
     source_url: str = Query(..., description="Target URL of the search results page to scrape"),
 ) -> dict[str, Any]:
-    """Fetch a results page from a URL and upsert its job cards into SQLite."""
-    html = await _fetch_html_smart(source_url)
-    postings = parse_html(html, source_url=source_url)
+    """Fetch a results page and stage only new source postings."""
+    fetched = await fetch_all_search_results(source_url)
+    postings = parse_html(fetched.html, source_url=source_url)
     if not postings:
         raise HTTPException(status_code=422, detail="No job postings were found at the provided URL.")
 
-    counts = _repository(request).upsert_search_results(postings)
+    counts = _repository(request).stage_new_search_results(postings)
     return {
         "found": len(postings),
         **counts,
+        "updated": 0,
         "jobs": [_job_summary(posting) for posting in postings],
     }
 
@@ -345,7 +438,10 @@ async def fetch_and_import_job_detail(
             status_code=404,
             detail="Import this job's search-results page before adding its detail page.",
         )
-    return {"updated": True, "job": updated}
+    return {
+        "updated": True, "job": updated,
+        "processing_status": _repository(request).get_processing_status(SOURCE_NAME, source_job_id),
+    }
 
 
 # --- Standard Read Endpoints ---

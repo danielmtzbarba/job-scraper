@@ -88,6 +88,7 @@ class JobListResponse(BaseModel):
 class JobDetailResponse(BaseModel):
     updated: bool
     job: JobMirrorRecord
+    processing_status: str | None = None
 
 
 class AirtableSyncWorkItem(BaseModel):
@@ -102,6 +103,7 @@ class AirtableSyncWorkItem(BaseModel):
 class SearchImportResponse(BaseModel):
     found: int
     inserted: int
-    updated: int
+    updated: int = 0
+    duplicate: int = 0
     skipped: int
     jobs: list[JobSummary]

@@ -46,10 +46,14 @@ class JobPosting(BaseModel):
 
     @property
     def deduplication_key(self) -> str | None:
+        source_key = (
+            "arbeitsagentur" if self.source == SOURCE_NAME
+            else re.sub(r"[^a-z0-9]+", "-", self.source.casefold()).strip("-")
+        )
         if self.source_job_id:
-            return f"arbeitsagentur:{self.source_job_id}"
+            return f"{source_key}:{self.source_job_id}"
         if self.job_url:
-            return f"arbeitsagentur:{self.job_url.rstrip('/')}"
+            return f"{source_key}:{self.job_url.rstrip('/')}"
         return None
 
     def to_dict(self) -> dict[str, str | None]:
