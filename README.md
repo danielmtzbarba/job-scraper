@@ -94,7 +94,35 @@ Available tools:
 
 FastAPI starts one Airtable sync worker when `AIRTABLE_TOKEN` is configured. The standalone stdio server starts its own worker if run separately. Local Streamable HTTP is available now; remote hosting and personal-account authentication are deferred until the GCP deployment phase.
 
-The versioned rubric and prompt are defined in `job_scraper/application/scoring_prompt.py`. Rubric/prompt v2.1.0 gives direct credit for demonstrated engineering capabilities on functionally equivalent tools, reserving a smaller deduction for required platform-specific operation. A named-tool gap is not deducted again from semantic experience. Language and education are excluded from both fit scores; the user's German-language and education/degree/grade requirements are treated as met and are not reported as gaps. The 70/20/10 skill and 60/25/15 experience subweights, 50/50 overall average, and category boundaries remain the same. Rubrics v1.0.0 and v2.0.0 remain in the source for comparison; existing scores are not changed automatically. If the JD lacks essential information, the assistant uses `mark_fit_needs_review` instead of inventing scores. The prompt treats JD and profile content as data, cites evidence IDs, and reports key gaps. The local server does not call Gemini automatically.
+The versioned rubric and prompt are defined in `job_scraper/application/scoring_prompt.py`. Rubric/prompt v2.1.0 gives direct credit for demonstrated engineering capabilities on functionally equivalent tools, reserving a smaller deduction for required platform-specific operation. A named-tool gap is not deducted again from semantic experience. Language and education are excluded from both fit scores; the user's German-language and education/degree/grade requirements are treated as met and are not reported as gaps. The 70/20/10 skill and 60/25/15 experience subweights, 50/50 overall average, and category boundaries remain the same. Rubrics v1.0.0 and v2.0.0 remain in the source for comparison; existing scores are not changed automatically. If the JD lacks essential information, the assistant uses `mark_fit_needs_review` instead of inventing scores. The prompt treats JD and profile content as data, cites evidence IDs, and reports key gaps.
+
+### Classification after enrichment
+
+Once detail enrichment saves a canonical job, it queues classification. An external application link is optional. Filtered jobs, merged duplicates, and unresolved possible duplicates are not queued. When `JOB_SCRAPER_AUTO_CLASSIFY=1`, the FastAPI process starts a separate worker thread that claims these newly enriched jobs and calls Vertex AI without holding a request or SQLite transaction open. It stores the selected profile, version, reason, and evaluation run in `job_classifications`. A match becomes ready for scoring while keeping Fit Status `Pending`; a clear nonmatch becomes `OutOfScope` and skips scoring. Failures retry up to three claims with delays. This flag defaults to off, and existing jobs are not queued retroactively when the new table is created.
+
+Set the project, location, model, `JOB_SCRAPER_INPUT_PRICE_PER_MILLION`, and `JOB_SCRAPER_OUTPUT_PRICE_PER_MILLION` in the ignored `.env` before enabling the worker. Add `OutOfScope` to Airtable's `Fit Status` choices before starting the API with Airtable sync enabled; otherwise Airtable will reject that status. The server does not expose a classification trigger through REST or MCP.
+
+### Triggered Vertex AI scoring
+
+The scoring CLI runs only when invoked. Preview the eligible jobs without making model calls:
+
+```sh
+uv run --cache-dir .local/uv-cache job-scraper-score --dry-run
+```
+
+A live run requires the intended GCP project, model, location, Application Default Credentials, enabled Vertex AI access, and current input/output prices for that exact model and location. Confirm the account, billing, region, and budget before using it. Put `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, and `JOB_SCRAPER_VERTEX_MODEL` in the ignored `.env`, then trigger at most ten newest classified, ready-for-scoring jobs:
+
+```sh
+uv run --cache-dir .local/uv-cache job-scraper-score \
+  --input-price-per-million INPUT_USD \
+  --output-price-per-million OUTPUT_USD
+```
+
+Replace `INPUT_USD` and `OUTPUT_USD` with numeric USD per million token rates from the selected model's [current Google Cloud price sheet](https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing). `--limit` may lower the maximum from ten. The CLI uses the saved classification and does not classify again; if the selected profile has a newer reviewed version, it queues reclassification instead of scoring with stale evidence. Unclear JDs become `NeedsReview`. The SDK retries transient 408/429/5xx responses up to three HTTP attempts; failed scoring jobs remain Pending for a later triggered run. Existing scored jobs are never selected automatically.
+
+The initial GCP project is `jobsearch-danielmtz-2026` under `deatheater.dm@gmail.com`. Local `.env` selects the `eu` Vertex endpoint and `gemini-3.1-flash-lite`; future app hosting is targeted for Frankfurt (`europe-west3`). A synthetic SDK request and one exploratory classification succeeded on 2026-10-04. Local Application Default Credentials were refreshed for the intended account and project with `gcloud auth application-default login deatheater.dm@gmail.com --project=jobsearch-danielmtz-2026`; this replaces the machine's previous ADC configuration. The account's actual trial credit balance and expiration must be checked in Cloud Billing. The project has a recurring €8 budget with 50%, 80%, and 100% alerts on gross usage before credits; alerts do not stop spending. For the model's EU Standard PayGo text rate checked on 2026-10-04, use `--input-price-per-million 0.275 --output-price-per-million 1.65`, then recheck current pricing before later runs. See [Vertex AI pricing and trial research](docs/research/vertex-ai-trial-pricing.md).
+
+SQLite's `evaluation_runs` table records every classification and scoring request, including failures, model/project/location, prompt and rubric versions, profile and version for scoring, response metadata, token counts, price rates, and estimated cost. `fit_assessment_provenance.evaluation_run_id` links the current automated score to its request; older manual scores have no model run. The cost estimate uses prompt tokens plus candidate and thinking tokens at the supplied rates, so it is an estimate rather than a billing statement. A batch reports calls whose cost could not be estimated separately. The CLI does not start the Airtable sync worker; local changes queue for the existing outbox. Before syncing `OutOfScope` to Airtable, add that choice to the `Fit Status` field in the existing Jobs table. No GCP resources or Airtable schema changes are created by this CLI.
 
 ### Private career profiles
 
@@ -109,7 +137,7 @@ The private `.local/profiles/build.py` script compiles initial drafts from selec
 ## Implementation sequence
 
 1. Define canonical job records and build the local Apify → normalize/deduplicate → Airtable vertical slice for one source.
-2. Add unattended Gemini/Vertex AI scoring as a separate worker; the local MCP tools already accept assistant-generated scores during an interactive session.
+2. Calibrate the triggered Gemini/Vertex AI classifier and scorer against real JDs before considering unattended scoring. The local MCP tools continue to accept assistant-generated scores during interactive sessions.
 3. Sort and report scored results; then add Gmail success digests and Slack failure alerts.
 4. Calibrate the five reviewed career profiles and rubric against real JDs; add personal-account authentication before any remote deployment.
 5. Verify actor/source costs and the $10/month ceiling, then plan GCP deployment separately.

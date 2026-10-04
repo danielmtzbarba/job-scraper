@@ -1,4 +1,4 @@
-"""Local FastAPI endpoints for importing supplied job HTML into SQLite."""
+"""FastAPI endpoints for importing and tracking job postings."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import random
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
+from threading import Event
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -24,18 +25,20 @@ from job_scraper.models.jobs import (
     JobSummary,
     SearchImportResponse,
 )
-from job_scraper.application.airtable_sync import airtable_sync_worker
+from job_scraper.application.classification_worker import ClassificationWorker, classification_loop
 from job_scraper.application.jobs import JobService
+from job_scraper.application.model_evaluation import ScoringSettings
 from job_scraper.application.profiles import ProfileStore
 from job_scraper.application.search_schedule import (
     SEARCH_BY_ID, SEARCHES, claim_search, execute_search, search_scheduler,
 )
-from job_scraper.integrations.airtable import AirtableSettings
+from job_scraper.integrations.vertex_ai import VertexModelClient
 from job_scraper.mcp.server import ServerContext, create_server
 from job_scraper.sources.arbeitsagentur.html_parser import JobPosting, parse_html
 from job_scraper.sources.arbeitsagentur.browser import fetch_all_search_results
 from job_scraper.logging_config import setup_logging
 from job_scraper.storage.sqlite_jobs import SQLiteJobRepository
+from job_scraper.storage.repository import create_repository
 
 MAX_HTML_BYTES = 10 * 1024 * 1024
 SOURCE_NAME = "Agentur für Arbeit"
@@ -53,12 +56,6 @@ USER_AGENT = (
 BLOCKED_STATUS_CODES = {403, 429, 503}
 
 
-def _database_path() -> Path:
-    configured = os.getenv("JOB_SCRAPER_DB_PATH", ".local/jobs.db")
-    path = Path(configured).expanduser()
-    return path if path.is_absolute() else PROJECT_ROOT / path
-
-
 def _profile_dir() -> Path:
     path = Path(os.getenv("JOB_SCRAPER_PROFILE_DIR", ".local/profiles")).expanduser()
     return path if path.is_absolute() else PROJECT_ROOT / path
@@ -74,6 +71,18 @@ def _detail_fetch_interval() -> int:
             fallback_seconds=60,
         )
         return 60
+
+
+def _classification_settings() -> ScoringSettings | None:
+    if os.getenv("JOB_SCRAPER_AUTO_CLASSIFY") != "1":
+        return None
+    return ScoringSettings(
+        project_id=os.getenv("GOOGLE_CLOUD_PROJECT", ""),
+        location=os.getenv("GOOGLE_CLOUD_LOCATION", ""),
+        model_id=os.getenv("JOB_SCRAPER_VERTEX_MODEL", ""),
+        input_price_per_million=float(os.getenv("JOB_SCRAPER_INPUT_PRICE_PER_MILLION", "0")),
+        output_price_per_million=float(os.getenv("JOB_SCRAPER_OUTPUT_PRICE_PER_MILLION", "0")),
+    )
 
 
 async def detail_fetcher_cron(
@@ -129,10 +138,11 @@ async def detail_fetcher_cron(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_dotenv(override=False)
-    repository = SQLiteJobRepository(_database_path())
+    repository = create_repository(PROJECT_ROOT)
     repository.initialize()
     app.state.jobs = repository
     app.state.profiles = ProfileStore(_profile_dir())
+    classification_settings = _classification_settings()
     app.state.search_tasks = set()
     scheduler_task = asyncio.create_task(
         search_scheduler(repository, fetch_all_search_results, app.state.search_tasks)
@@ -140,14 +150,21 @@ async def lifespan(app: FastAPI):
     worker_task = asyncio.create_task(
         detail_fetcher_cron(repository, interval_seconds=_detail_fetch_interval())
     )
-    airtable_settings = AirtableSettings.from_environment()
-    airtable_task = None
-    if airtable_settings:
-        airtable_task = asyncio.create_task(
-            airtable_sync_worker(repository, airtable_settings)
+    classification_task = None
+    classification_stop = Event()
+    classification_model = None
+    if classification_settings:
+        classification_model = VertexModelClient(
+            project_id=classification_settings.project_id,
+            location=classification_settings.location,
+            model_id=classification_settings.model_id,
         )
-    else:
-        logger.warning("airtable_sync", action="worker_disabled")
+        classifier = ClassificationWorker(
+            repository, app.state.profiles, classification_model, classification_settings
+        )
+        classification_task = asyncio.create_task(asyncio.to_thread(
+            classification_loop, classifier, classification_stop, 10
+        ))
     try:
         async with mcp_server.session_manager.run():
             yield
@@ -156,8 +173,7 @@ async def lifespan(app: FastAPI):
         for task in app.state.search_tasks:
             task.cancel()
         worker_task.cancel()
-        if airtable_task:
-            airtable_task.cancel()
+        classification_stop.set()
         try:
             await scheduler_task
         except asyncio.CancelledError:
@@ -168,17 +184,18 @@ async def lifespan(app: FastAPI):
             await worker_task
         except asyncio.CancelledError:
             pass
-        if airtable_task:
-            try:
-                await airtable_task
-            except asyncio.CancelledError:
-                pass
+        if classification_task:
+            await classification_task
+        if classification_model:
+            classification_model.close()
+        if hasattr(repository, "close"):
+            repository.close()
         logger.info("api_shutdown_complete")
 
 
 app = FastAPI(
     title="Job Scraper Local API",
-    description="Import Arbeitsagentur HTML into a local SQLite database via upload or direct fetch.",
+    description="Import Arbeitsagentur HTML into the selected job database via upload or direct fetch.",
     version="0.1.0",
     lifespan=lifespan,
 )
@@ -267,7 +284,7 @@ def _validate_ba_url(url: str) -> None:
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "storage": "sqlite"}
+    return {"status": "ok", "storage": os.getenv("JOB_SCRAPER_STORAGE", "sqlite")}
 
 
 @app.get("/searches")

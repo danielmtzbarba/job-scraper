@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
 from collections.abc import AsyncIterator
@@ -17,7 +16,6 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver import Context
 from pydantic import BaseModel, ConfigDict, Field
 
-from job_scraper.application.airtable_sync import airtable_sync_worker
 from job_scraper.application.jobs import JobService
 from job_scraper.application.profiles import ProfileStore
 from job_scraper.application.scoring_prompt import (
@@ -25,12 +23,11 @@ from job_scraper.application.scoring_prompt import (
     RUBRIC_VERSION,
     render_scoring_prompt,
 )
-from job_scraper.integrations.airtable import AirtableSettings
 from job_scraper.logging_config import setup_logging
 from job_scraper.models.jobs import ApplicationStatus, JobMirrorRecord
 from job_scraper.models.profiles import ProfileId, ScoringProfile
 from job_scraper.models.scoring import FitAssessment, NeedsReviewAssessment
-from job_scraper.storage.sqlite_jobs import SQLiteJobRepository
+from job_scraper.storage.repository import create_repository
 
 # MCP stdio uses stdout for protocol messages, so application logs must use stderr.
 setup_logging("job-scraper-mcp", stream=sys.stderr)
@@ -66,33 +63,17 @@ class ServerContext:
 async def _server_lifespan(_server: MCPServer) -> AsyncIterator[ServerContext]:
     project_root = Path(__file__).resolve().parents[2]
     load_dotenv(project_root / ".env", override=False)
-    database_path = Path(
-        os.getenv("JOB_SCRAPER_DB_PATH", ".local/jobs.db")
-    ).expanduser()
-    if not database_path.is_absolute():
-        database_path = project_root / database_path
-    repository = SQLiteJobRepository(database_path)
+    repository = create_repository(project_root)
     repository.initialize()
     profile_dir = Path(os.getenv("JOB_SCRAPER_PROFILE_DIR", ".local/profiles")).expanduser()
     if not profile_dir.is_absolute():
         profile_dir = project_root / profile_dir
 
-    airtable_settings = AirtableSettings.from_environment()
-    sync_task: asyncio.Task[None] | None = None
-    if airtable_settings:
-        sync_task = asyncio.create_task(
-            airtable_sync_worker(repository, airtable_settings)
-        )
-
     try:
         yield ServerContext(jobs=JobService(repository), profiles=ProfileStore(profile_dir))
     finally:
-        if sync_task:
-            sync_task.cancel()
-            try:
-                await sync_task
-            except asyncio.CancelledError:
-                pass
+        if hasattr(repository, "close"):
+            repository.close()
 
 
 def create_server(
@@ -122,7 +103,7 @@ def create_server(
         ctx: Context[ServerContext],
         query: Annotated[str | None, Field(max_length=200)] = None,
         source: Annotated[str | None, Field(max_length=100)] = None,
-        fit_status: Literal["Pending", "Scored", "NeedsReview"] | None = None,
+        fit_status: Literal["Pending", "Scored", "NeedsReview", "OutOfScope"] | None = None,
         limit: Annotated[int, Field(ge=1, le=100)] = 20,
         offset: Annotated[int, Field(ge=0)] = 0,
     ) -> list[JobMirrorRecord]:

@@ -13,6 +13,7 @@ from job_scraper.sources.arbeitsagentur.html_parser import JobPosting
 ApplicationStatus = Literal[
     "Saved", "Applied", "Interview", "Offer", "Rejected", "Withdrawn", "Ignored"
 ]
+FitStatus = Literal["Pending", "Scored", "NeedsReview", "OutOfScope"]
 
 
 class JobMirrorRecord(BaseModel):
@@ -40,7 +41,7 @@ class JobMirrorRecord(BaseModel):
     overall_fit: float | None = Field(default=None, alias="Overall Fit")
     fit_category: str | None = Field(default=None, alias="Fit Category")
     fit_explanation: str | None = Field(default=None, alias="Fit Explanation")
-    fit_status: str = Field(default="Pending", alias="Fit Status")
+    fit_status: FitStatus = Field(default="Pending", alias="Fit Status")
     search_run_id: str | None = Field(default=None, alias="Search Run ID")
     posted_at: date | None = Field(default=None, alias="Posted At")
 

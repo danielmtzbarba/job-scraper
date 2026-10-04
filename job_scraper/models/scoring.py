@@ -47,3 +47,48 @@ class NeedsReviewAssessment(BaseModel):
     rubric_version: str = Field(min_length=1)
     prompt_version: str = Field(min_length=1)
     review_reason: str = Field(min_length=1, max_length=4000)
+
+
+class ProfileClassification(BaseModel):
+    """Route a JD to one reviewed profile, or skip it as outside target roles."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["profile", "out_of_scope"]
+    profile_id: ProfileId | None = None
+    reason: str = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def profile_matches_decision(self) -> ProfileClassification:
+        if not self.reason.strip():
+            raise ValueError("classification requires a meaningful reason")
+        if (self.decision == "profile") != (self.profile_id is not None):
+            raise ValueError("profile decisions require one profile_id; out_of_scope requires none")
+        return self
+
+
+class ModelFitDecision(BaseModel):
+    """Small structured response from Gemini before local assessment validation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["scored", "needs_review"]
+    skill_stack_fit: float | None = Field(default=None, ge=0, le=100)
+    semantic_experience_fit: float | None = Field(default=None, ge=0, le=100)
+    fit_explanation: str | None = Field(default=None, max_length=4000)
+    review_reason: str | None = Field(default=None, max_length=4000)
+
+    @model_validator(mode="after")
+    def fields_match_decision(self) -> ModelFitDecision:
+        if self.decision == "scored":
+            if (self.skill_stack_fit is None or self.semantic_experience_fit is None
+                    or not self.fit_explanation or not self.fit_explanation.strip()):
+                raise ValueError("scored decisions require both scores and an explanation")
+            if self.review_reason is not None:
+                raise ValueError("scored decisions cannot include a review reason")
+        else:
+            if not self.review_reason or not self.review_reason.strip():
+                raise ValueError("needs_review decisions require a reason")
+            if any(value is not None for value in (self.skill_stack_fit, self.semantic_experience_fit, self.fit_explanation)):
+                raise ValueError("needs_review decisions cannot include scores or an explanation")
+        return self

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from uuid import uuid4
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -107,6 +108,7 @@ class SQLiteJobRepository:
                     profile_version INTEGER NOT NULL,
                     rubric_version TEXT,
                     prompt_version TEXT,
+                    evaluation_run_id TEXT,
                     assessed_at TEXT NOT NULL,
                     PRIMARY KEY (source, deduplication_key)
                 );
@@ -139,6 +141,50 @@ class SQLiteJobRepository:
                     skipped INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
                     UNIQUE (search_id, slot_date)
+                );
+                CREATE TABLE IF NOT EXISTS evaluation_runs (
+                    id TEXT PRIMARY KEY,
+                    batch_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    deduplication_key TEXT NOT NULL,
+                    stage TEXT NOT NULL CHECK (stage IN ('classification', 'scoring')),
+                    status TEXT NOT NULL CHECK (status IN ('Running', 'Completed', 'Failed')),
+                    model_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    location TEXT NOT NULL,
+                    classifier_prompt_version TEXT,
+                    profile_id TEXT,
+                    profile_version INTEGER,
+                    rubric_version TEXT,
+                    prompt_version TEXT,
+                    input_price_per_million REAL NOT NULL,
+                    output_price_per_million REAL NOT NULL,
+                    prompt_tokens INTEGER,
+                    candidate_tokens INTEGER,
+                    thought_tokens INTEGER,
+                    estimated_cost_usd REAL,
+                    result_json TEXT,
+                    error_type TEXT,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS job_classifications (
+                    source TEXT NOT NULL,
+                    deduplication_key TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN
+                        ('Pending', 'Running', 'Classified', 'OutOfScope', 'Failed')),
+                    profile_id TEXT,
+                    profile_version INTEGER,
+                    reason TEXT,
+                    classifier_prompt_version TEXT,
+                    evaluation_run_id TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    claimed_at TEXT,
+                    next_retry_at TEXT,
+                    error_type TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (source, deduplication_key)
                 );
                 """
             )
@@ -175,6 +221,7 @@ class SQLiteJobRepository:
                 "airtable_sync_status": "TEXT NOT NULL DEFAULT 'Pending'",
                 "airtable_sync_attempts": "INTEGER NOT NULL DEFAULT 0",
                 "airtable_sync_error": "TEXT",
+                "scoring_claimed_at": "TEXT",
             }
             for column_name, column_definition in additive_columns.items():
                 if column_name not in processing_columns:
@@ -186,11 +233,19 @@ class SQLiteJobRepository:
                 row[1]
                 for row in connection.execute("PRAGMA table_info(fit_assessment_provenance)")
             }
-            for column_name in ("rubric_version", "prompt_version"):
+            for column_name in ("rubric_version", "prompt_version", "evaluation_run_id"):
                 if column_name not in provenance_columns:
                     connection.execute(
                         f"ALTER TABLE fit_assessment_provenance ADD COLUMN {column_name} TEXT"
                     )
+
+            evaluation_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(evaluation_runs)")
+            }
+            if "batch_id" not in evaluation_columns:
+                connection.execute(
+                    "ALTER TABLE evaluation_runs ADD COLUMN batch_id TEXT NOT NULL DEFAULT 'legacy'"
+                )
 
             connection.executescript(
                 """
@@ -202,6 +257,12 @@ class SQLiteJobRepository:
                     ON jobs (source, source_job_id);
                 CREATE INDEX IF NOT EXISTS idx_jobs_company_title
                     ON jobs (company, title);
+                CREATE INDEX IF NOT EXISTS idx_evaluation_runs_job
+                    ON evaluation_runs (source, deduplication_key, started_at);
+                CREATE INDEX IF NOT EXISTS idx_evaluation_runs_batch
+                    ON evaluation_runs (batch_id);
+                CREATE INDEX IF NOT EXISTS idx_job_classifications_queue
+                    ON job_classifications (status, next_retry_at, created_at);
                 """
             )
 
@@ -216,9 +277,11 @@ class SQLiteJobRepository:
                 connection.execute("DROP TABLE jobs_legacy")
 
             connection.execute(
-                """INSERT OR IGNORE INTO source_aliases
+                """INSERT INTO source_aliases
                    (source, deduplication_key, canonical_source, canonical_key)
-                   SELECT source, deduplication_key, source, deduplication_key FROM jobs"""
+                   SELECT source, deduplication_key, source, deduplication_key FROM jobs
+                   WHERE true
+                   ON CONFLICT (source, deduplication_key) DO NOTHING"""
             )
 
             # Recover only claims that have exceeded the lease period. The API
@@ -234,6 +297,19 @@ class SQLiteJobRepository:
                 "UPDATE job_processing SET airtable_sync_status = 'Pending' "
                 "WHERE airtable_sync_status = 'Processing' AND updated_at <= ?",
                 (stale_before,),
+            )
+            connection.execute(
+                """UPDATE evaluation_runs SET status = 'Failed',
+                     error_type = 'Interrupted', finished_at = ?
+                   WHERE status = 'Running' AND started_at <= ?""",
+                (_utc_now(), stale_before),
+            )
+            connection.execute(
+                """UPDATE job_classifications SET
+                     status = CASE WHEN attempts >= 3 THEN 'Failed' ELSE 'Pending' END,
+                     claimed_at = NULL, next_retry_at = NULL, updated_at = ?
+                   WHERE status = 'Running' AND claimed_at <= ?""",
+                (_utc_now(), stale_before),
             )
 
     def _migrate_legacy_jobs(self, connection: sqlite3.Connection) -> None:
@@ -277,11 +353,12 @@ class SQLiteJobRepository:
             }.get(status, "Pending")
             now = _utc_now()
             connection.execute(
-                """INSERT OR IGNORE INTO job_processing (
+                """INSERT INTO job_processing (
                     source, deduplication_key, source_job_id, payload_json,
                     processing_status, fetch_attempts, fetch_error,
                     airtable_sync_status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', ?, ?)
+                ON CONFLICT (source, deduplication_key) DO NOTHING""",
                 (
                     source, key, payload.source_job_id, payload.model_dump_json(),
                     processing_status, int(item.get("detail_fetch_attempts") or 0),
@@ -350,7 +427,7 @@ class SQLiteJobRepository:
     def list_search_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._connect() as connection:
             return [dict(row) for row in connection.execute(
-                "SELECT * FROM search_runs ORDER BY started_at DESC, rowid DESC LIMIT ?", (limit,)
+                "SELECT * FROM search_runs ORDER BY started_at DESC, id DESC LIMIT ?", (limit,)
             )]
 
     def claim_next_detail_job(self) -> str | None:
@@ -563,9 +640,12 @@ class SQLiteJobRepository:
                 exact, possible = self._cross_source_matches(connection, candidate)
                 if exact is not None and not possible:
                     connection.execute(
-                        """INSERT OR REPLACE INTO source_aliases
+                        """INSERT INTO source_aliases
                            (source, deduplication_key, canonical_source, canonical_key)
-                           VALUES (?, ?, ?, ?)""",
+                           VALUES (?, ?, ?, ?)
+                           ON CONFLICT (source, deduplication_key) DO UPDATE SET
+                             canonical_source = excluded.canonical_source,
+                             canonical_key = excluded.canonical_key""",
                         (detail.source, staged.deduplication_key, exact["source"], exact["deduplication_key"]),
                     )
                     connection.execute(
@@ -578,9 +658,10 @@ class SQLiteJobRepository:
                 if possible:
                     for match in possible:
                         connection.execute(
-                            """INSERT OR IGNORE INTO possible_duplicates
+                            """INSERT INTO possible_duplicates
                                (source, deduplication_key, possible_source, possible_key,
-                                reason, created_at) VALUES (?, ?, ?, ?, ?, ?)""",
+                                reason, created_at) VALUES (?, ?, ?, ?, ?, ?)
+                               ON CONFLICT DO NOTHING""",
                             (detail.source, staged.deduplication_key, match["source"],
                              match["deduplication_key"], match["reason"], _utc_now()),
                         )
@@ -592,10 +673,22 @@ class SQLiteJobRepository:
                     )
                     return candidate.model_dump(mode="json")
             mirror = self._upsert_mirror(connection, merged.to_mirror_record())
+            # Only newly enriched canonical jobs enter automatic classification.
+            # Existing jobs are intentionally not backfilled on API startup.
+            if existing_job is None and mirror.fit_status == "Pending":
+                now = _utc_now()
+                connection.execute(
+                    """INSERT INTO job_classifications
+                       (source, deduplication_key, status, created_at, updated_at)
+                       VALUES (?, ?, 'Pending', ?, ?)
+                       ON CONFLICT (source, deduplication_key) DO NOTHING""",
+                    (detail.source, staged.deduplication_key, now, now),
+                )
             connection.execute(
-                """INSERT OR IGNORE INTO source_aliases
+                """INSERT INTO source_aliases
                    (source, deduplication_key, canonical_source, canonical_key)
-                   VALUES (?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT (source, deduplication_key) DO NOTHING""",
                 (detail.source, staged.deduplication_key, detail.source, staged.deduplication_key),
             )
             now = _utc_now()
@@ -717,9 +810,12 @@ class SQLiteJobRepository:
                 status = "ReadyToSync"
                 canonical_source, canonical_key = source, deduplication_key
             connection.execute(
-                """INSERT OR REPLACE INTO source_aliases
+                """INSERT INTO source_aliases
                    (source, deduplication_key, canonical_source, canonical_key)
-                   VALUES (?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT (source, deduplication_key) DO UPDATE SET
+                     canonical_source = excluded.canonical_source,
+                     canonical_key = excluded.canonical_key""",
                 (source, deduplication_key, canonical_source, canonical_key),
             )
             connection.execute(
@@ -796,7 +892,318 @@ class SQLiteJobRepository:
                 f"SELECT * FROM jobs {where_clause} ORDER BY posted_at DESC LIMIT ? OFFSET ?",
                 parameters,
             ).fetchall()
-            return [self._row_to_record(dict(row)).model_dump(mode="json") for row in rows]
+        return [self._row_to_record(dict(row)).model_dump(mode="json") for row in rows]
+
+    def claim_next_classification_job(self) -> dict[str, Any] | None:
+        """Claim one newly enriched canonical job; never scan the old backlog."""
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT j.*, c.attempts FROM job_classifications AS c
+                   JOIN jobs AS j ON j.source = c.source
+                    AND j.deduplication_key = c.deduplication_key
+                   WHERE c.status = 'Pending' AND c.attempts < 3
+                     AND j.fit_status = 'Pending'
+                     AND (c.next_retry_at IS NULL OR c.next_retry_at <= ?)
+                   ORDER BY (j.posted_at IS NULL), j.posted_at DESC,
+                            c.created_at DESC, c.deduplication_key
+                   LIMIT 1""",
+                (now,),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """UPDATE job_classifications SET status = 'Running',
+                     attempts = attempts + 1, claimed_at = ?, updated_at = ?,
+                     next_retry_at = NULL, error_type = NULL
+                   WHERE source = ? AND deduplication_key = ?""",
+                (now, now, row["source"], row["deduplication_key"]),
+            )
+            result = self._row_to_record(dict(row)).model_dump(mode="json")
+            result["_classification_claimed_at"] = now
+            return result
+
+    def complete_classification(
+        self,
+        *,
+        source: str,
+        deduplication_key: str,
+        claimed_at: str,
+        profile_id: str | None,
+        profile_version: int | None,
+        reason: str,
+        classifier_prompt_version: str,
+        evaluation_run_id: str,
+    ) -> None:
+        """Save the current selection and any OutOfScope Airtable patch atomically."""
+        if not reason.strip() or (profile_id is None) != (profile_version is None):
+            raise ValueError("Classification requires a reason and a paired profile/version")
+        now = _utc_now()
+        status = "Classified" if profile_id is not None else "OutOfScope"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            claim = connection.execute(
+                """SELECT status, claimed_at FROM job_classifications
+                   WHERE source = ? AND deduplication_key = ?""",
+                (source, deduplication_key),
+            ).fetchone()
+            job = connection.execute(
+                "SELECT * FROM jobs WHERE source = ? AND deduplication_key = ?",
+                (source, deduplication_key),
+            ).fetchone()
+            if (claim is None or claim["status"] != "Running"
+                    or claim["claimed_at"] != claimed_at or job is None
+                    or job["fit_status"] != "Pending"):
+                raise RuntimeError("Classification claim or Pending job changed")
+            connection.execute(
+                """UPDATE job_classifications SET status = ?, profile_id = ?,
+                     profile_version = ?, reason = ?, classifier_prompt_version = ?,
+                     evaluation_run_id = ?, claimed_at = NULL, error_type = NULL,
+                     updated_at = ? WHERE source = ? AND deduplication_key = ?""",
+                (status, profile_id, profile_version, reason,
+                 classifier_prompt_version, evaluation_run_id, now,
+                 source, deduplication_key),
+            )
+            if status == "OutOfScope":
+                connection.execute(
+                    """UPDATE jobs SET fit_status = 'OutOfScope',
+                         skill_stack_fit = NULL, semantic_experience_fit = NULL,
+                         overall_fit = NULL, fit_category = NULL, fit_explanation = ?
+                       WHERE source = ? AND deduplication_key = ?""",
+                    (reason, source, deduplication_key),
+                )
+                processing = connection.execute(
+                    """SELECT airtable_pending_fields_json FROM job_processing
+                       WHERE source = ? AND deduplication_key = ?""",
+                    (source, deduplication_key),
+                ).fetchone()
+                if processing is None:
+                    raise RuntimeError("Classification has no processing row")
+                pending = json.loads(processing["airtable_pending_fields_json"] or "{}")
+                pending.update({
+                    "Fit Status": "OutOfScope", "Fit Explanation": reason,
+                    "Skill/Stack Fit": None, "Semantic Experience Fit": None,
+                    "Overall Fit": None, "Fit Category": None,
+                })
+                connection.execute(
+                    """UPDATE job_processing SET airtable_pending_fields_json = ?,
+                         airtable_sync_status = 'Pending', airtable_sync_error = NULL,
+                         airtable_next_retry_at = NULL, updated_at = ?
+                       WHERE source = ? AND deduplication_key = ?""",
+                    (json.dumps(pending, ensure_ascii=False), now,
+                     source, deduplication_key),
+                )
+                connection.execute(
+                    """DELETE FROM fit_assessment_provenance
+                       WHERE source = ? AND deduplication_key = ?""",
+                    (source, deduplication_key),
+                )
+
+    def fail_classification(
+        self, source: str, deduplication_key: str, claimed_at: str, error_type: str
+    ) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT attempts FROM job_classifications WHERE source = ?
+                   AND deduplication_key = ? AND status = 'Running' AND claimed_at = ?""",
+                (source, deduplication_key, claimed_at),
+            ).fetchone()
+            if row is None:
+                return
+            attempts = int(row["attempts"])
+            next_retry = (
+                (datetime.now(timezone.utc) + timedelta(minutes=2 ** attempts))
+                .isoformat(timespec="seconds") if attempts < 3 else None
+            )
+            connection.execute(
+                """UPDATE job_classifications SET status = ?, claimed_at = NULL,
+                     next_retry_at = ?, error_type = ?, updated_at = ?
+                   WHERE source = ? AND deduplication_key = ? AND claimed_at = ?""",
+                ("Pending" if attempts < 3 else "Failed", next_retry,
+                 error_type, _utc_now(), source, deduplication_key, claimed_at),
+            )
+
+    def get_classification(self, source: str, deduplication_key: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT * FROM job_classifications
+                   WHERE source = ? AND deduplication_key = ?""",
+                (source, deduplication_key),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def requeue_classification(self, source: str, deduplication_key: str) -> None:
+        """Refresh a selection when its reviewed profile version has changed."""
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE job_classifications SET status = 'Pending',
+                     profile_id = NULL, profile_version = NULL, reason = NULL,
+                     classifier_prompt_version = NULL, evaluation_run_id = NULL,
+                     attempts = 0, claimed_at = NULL, next_retry_at = NULL,
+                     error_type = NULL, updated_at = ?
+                   WHERE source = ? AND deduplication_key = ? AND status = 'Classified'
+                     AND EXISTS (SELECT 1 FROM jobs AS j WHERE j.source = ?
+                       AND j.deduplication_key = ? AND j.fit_status = 'Pending')""",
+                (_utc_now(), source, deduplication_key, source, deduplication_key),
+            )
+
+    @staticmethod
+    def _pending_scoring_rows(connection: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
+        return connection.execute(
+            """SELECT j.*, c.profile_id AS _classified_profile_id,
+                      c.profile_version AS _classified_profile_version
+                 FROM jobs AS j
+               JOIN job_processing AS p
+                 ON p.source = j.source AND p.deduplication_key = j.deduplication_key
+               JOIN job_classifications AS c
+                 ON c.source = j.source AND c.deduplication_key = j.deduplication_key
+               WHERE j.source = ? AND j.source_job_id IS NOT NULL
+                 AND j.fit_status = 'Pending'
+                 AND c.status = 'Classified' AND c.profile_id IS NOT NULL
+                 AND (p.scoring_claimed_at IS NULL OR p.scoring_claimed_at <= ?)
+               ORDER BY (j.posted_at IS NULL), j.posted_at DESC,
+                        p.created_at DESC, j.deduplication_key
+               LIMIT ?""",
+            (_SOURCE, _stale_processing_cutoff(), limit),
+        ).fetchall()
+
+    def preview_pending_scoring_jobs(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Show the same eligible jobs as a claim, without reserving them."""
+        if not 1 <= limit <= 10:
+            raise ValueError("Scoring run limit must be between 1 and 10")
+        with self._connect() as connection:
+            rows = self._pending_scoring_rows(connection, limit)
+            return [
+                {**self._row_to_record(dict(row)).model_dump(mode="json"),
+                 "selected_profile_id": row["_classified_profile_id"],
+                 "selected_profile_version": row["_classified_profile_version"]}
+                for row in rows
+            ]
+
+    def claim_pending_scoring_jobs(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Atomically reserve the newest pending jobs for one triggered run."""
+        if not 1 <= limit <= 10:
+            raise ValueError("Scoring run limit must be between 1 and 10")
+        claimed_at = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = self._pending_scoring_rows(connection, limit)
+            for row in rows:
+                connection.execute(
+                    """UPDATE job_processing SET scoring_claimed_at = ?
+                       WHERE source = ? AND deduplication_key = ?""",
+                    (claimed_at, row["source"], row["deduplication_key"]),
+                )
+            return [
+                {**self._row_to_record(dict(row)).model_dump(mode="json"),
+                 "_scoring_claimed_at": claimed_at,
+                 "_classified_profile_id": row["_classified_profile_id"],
+                 "_classified_profile_version": row["_classified_profile_version"]}
+                for row in rows
+            ]
+
+    def release_scoring_claim(self, source: str, deduplication_key: str, claimed_at: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE job_processing SET scoring_claimed_at = NULL
+                   WHERE source = ? AND deduplication_key = ? AND scoring_claimed_at = ?""",
+                (source, deduplication_key, claimed_at),
+            )
+
+    def start_evaluation_run(
+        self,
+        *,
+        batch_id: str,
+        source: str,
+        deduplication_key: str,
+        stage: str,
+        model_id: str,
+        project_id: str,
+        location: str,
+        input_price_per_million: float,
+        output_price_per_million: float,
+        classifier_prompt_version: str | None = None,
+        profile_id: str | None = None,
+        profile_version: int | None = None,
+        rubric_version: str | None = None,
+        prompt_version: str | None = None,
+    ) -> str:
+        """Start an append-only audit record before making a model request."""
+        run_id = str(uuid4())
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO evaluation_runs (
+                     id, batch_id, source, deduplication_key, stage, status, model_id,
+                     project_id, location, classifier_prompt_version, profile_id,
+                     profile_version, rubric_version, prompt_version,
+                     input_price_per_million, output_price_per_million, started_at
+                   ) VALUES (?, ?, ?, ?, ?, 'Running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id, batch_id, source, deduplication_key, stage, model_id, project_id,
+                    location, classifier_prompt_version, profile_id, profile_version,
+                    rubric_version, prompt_version, input_price_per_million,
+                    output_price_per_million, _utc_now(),
+                ),
+            )
+        return run_id
+
+    def estimated_batch_cost(self, batch_id: str) -> float:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(SUM(estimated_cost_usd), 0) FROM evaluation_runs WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            return round(float(row[0]), 8)
+
+    def unestimated_batch_calls(self, batch_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) FROM evaluation_runs
+                   WHERE batch_id = ? AND status != 'Running'
+                     AND estimated_cost_usd IS NULL""",
+                (batch_id,),
+            ).fetchone()
+            return int(row[0])
+
+    def finish_evaluation_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        prompt_tokens: int | None = None,
+        candidate_tokens: int | None = None,
+        thought_tokens: int | None = None,
+        estimated_cost_usd: float | None = None,
+        result: dict[str, Any] | None = None,
+        error_type: str | None = None,
+    ) -> None:
+        if status not in {"Completed", "Failed"}:
+            raise ValueError("Evaluation run must finish as Completed or Failed")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE evaluation_runs SET status = ?, prompt_tokens = ?,
+                     candidate_tokens = ?, thought_tokens = ?, estimated_cost_usd = ?,
+                     result_json = ?, error_type = ?, finished_at = ?
+                   WHERE id = ? AND status = 'Running'""",
+                (
+                    status, prompt_tokens, candidate_tokens, thought_tokens,
+                    estimated_cost_usd,
+                    json.dumps(result, ensure_ascii=False) if result is not None else None,
+                    error_type, _utc_now(), run_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Evaluation run {run_id} is not running")
+
+    def list_evaluation_runs(self, source: str, deduplication_key: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM evaluation_runs WHERE source = ? AND deduplication_key = ?
+                   ORDER BY started_at, id""",
+                (source, deduplication_key),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def get_job(self, source_job_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -815,6 +1222,7 @@ class SQLiteJobRepository:
         profile_version: int | None = None,
         rubric_version: str | None = None,
         prompt_version: str | None = None,
+        evaluation_run_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Update user-managed job fields and queue their Airtable patch."""
         allowed_fields = {
@@ -835,6 +1243,8 @@ class SQLiteJobRepository:
             raise ValueError("Fit updates require rubric and prompt versions.")
         if profile_id is None and (rubric_version is not None or prompt_version is not None):
             raise ValueError("Rubric and prompt versions require a profile.")
+        if evaluation_run_id is not None and profile_id is None:
+            raise ValueError("An evaluation run requires a scored profile.")
 
         with self._connect() as connection:
             row = connection.execute(
@@ -896,13 +1306,14 @@ class SQLiteJobRepository:
                 connection.execute(
                     """INSERT INTO fit_assessment_provenance
                        (source, deduplication_key, profile_id, profile_version,
-                        rubric_version, prompt_version, assessed_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                        rubric_version, prompt_version, evaluation_run_id, assessed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(source, deduplication_key) DO UPDATE SET
                          profile_id = excluded.profile_id,
                          profile_version = excluded.profile_version,
                          rubric_version = excluded.rubric_version,
                          prompt_version = excluded.prompt_version,
+                         evaluation_run_id = excluded.evaluation_run_id,
                          assessed_at = excluded.assessed_at""",
                     (
                         _SOURCE,
@@ -911,8 +1322,14 @@ class SQLiteJobRepository:
                         profile_version,
                         rubric_version,
                         prompt_version,
+                        evaluation_run_id,
                         _utc_now(),
                     ),
+                )
+            elif fields.get("fit_status") == "OutOfScope":
+                connection.execute(
+                    "DELETE FROM fit_assessment_provenance WHERE source = ? AND deduplication_key = ?",
+                    (_SOURCE, row["deduplication_key"]),
                 )
             return serialized
 

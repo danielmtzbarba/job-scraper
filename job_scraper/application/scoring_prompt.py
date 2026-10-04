@@ -126,6 +126,7 @@ def render_scoring_prompt(
     profile: ScoringProfile,
     *,
     version: str = RUBRIC_VERSION,
+    automated: bool = False,
 ) -> str:
     """Build the complete prompt without loading any upstream CV or dossier."""
     try:
@@ -157,6 +158,44 @@ def render_scoring_prompt(
     }
     jd_json = json.dumps(jd, ensure_ascii=False, indent=2)
     profile_json = profile.model_dump_json(indent=2)
+    output_instructions = (
+        """Return exactly one JSON object with these fields: decision, skill_stack_fit,
+semantic_experience_fit, fit_explanation, and review_reason. If there is enough
+information, set decision to scored, supply both 0–100 dimension scores and a
+concise explanation citing evidence IDs, and set review_reason to null. If the
+JD or a central requirement is too unclear, set decision to needs_review,
+supply a reason, and set both scores and fit_explanation to null. Do not make
+up scores. The application calculates overall fit and category. Do not include
+profile or instruction versions in the response; the application records them.
+"""
+        if automated
+        else f"""Return exactly one JSON object, with no surrounding prose.
+
+If there is enough information to score, return:
+{{
+  "profile_id": "{profile.id}",
+  "profile_version": {profile.version},
+  "rubric_version": "{version}",
+  "prompt_version": "{version}",
+  "skill_stack_fit": 0,
+  "semantic_experience_fit": 0,
+  "fit_category": "Strong | Good | Stretch | Low",
+  "fit_explanation": "Concise assessment citing evidence IDs, direct or adjacent fit, and key gaps."
+}}
+Replace the example scores and category with the assessment. The category must
+match the 50/50 average. Submit this object to save_fit_assessment.
+
+If the JD or a central requirement is too unclear to score reliably, return:
+{{
+  "profile_id": "{profile.id}",
+  "profile_version": {profile.version},
+  "rubric_version": "{version}",
+  "prompt_version": "{version}",
+  "review_reason": "Explain what essential information is missing."
+}}
+Submit that object to mark_fit_needs_review. Do not make up numeric scores.
+"""
+    )
     return f"""Assume the role of the hiring manager for the following JD:
 
 <job_description_data>
@@ -183,31 +222,7 @@ consequential gaps. Do not infer unsupported facts or award points for an
 exact title match. Do not calculate overall fit; the application does that.
 {eligibility_guidance}
 
-Return exactly one JSON object, with no surrounding prose.
-
-If there is enough information to score, return:
-{{
-  "profile_id": "{profile.id}",
-  "profile_version": {profile.version},
-  "rubric_version": "{version}",
-  "prompt_version": "{version}",
-  "skill_stack_fit": 0,
-  "semantic_experience_fit": 0,
-  "fit_category": "Strong | Good | Stretch | Low",
-  "fit_explanation": "Concise assessment citing evidence IDs, direct or adjacent fit, and key gaps."
-}}
-Replace the example scores and category with the assessment. The category must
-match the 50/50 average. Submit this object to save_fit_assessment.
-
-If the JD or a central requirement is too unclear to score reliably, return:
-{{
-  "profile_id": "{profile.id}",
-  "profile_version": {profile.version},
-  "rubric_version": "{version}",
-  "prompt_version": "{version}",
-  "review_reason": "Explain what essential information is missing."
-}}
-Submit that object to mark_fit_needs_review. Do not make up numeric scores.
+{output_instructions}
 
 Prompt version: {version}.
 """

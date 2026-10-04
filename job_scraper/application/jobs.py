@@ -49,7 +49,8 @@ class JobService:
         return self._update(source_job_id, fields)
 
     def save_fit_assessment(
-        self, source_job_id: str, assessment: FitAssessment
+        self, source_job_id: str, assessment: FitAssessment,
+        *, evaluation_run_id: str | None = None,
     ) -> JobMirrorRecord:
         overall_fit = round(
             (assessment.skill_stack_fit + assessment.semantic_experience_fit) / 2,
@@ -69,10 +70,12 @@ class JobService:
             profile_version=assessment.profile_version,
             rubric_version=assessment.rubric_version,
             prompt_version=assessment.prompt_version,
+            evaluation_run_id=evaluation_run_id,
         )
 
     def mark_fit_needs_review(
-        self, source_job_id: str, assessment: NeedsReviewAssessment
+        self, source_job_id: str, assessment: NeedsReviewAssessment,
+        *, evaluation_run_id: str | None = None,
     ) -> JobMirrorRecord:
         """Clear a prior score when the JD cannot be assessed reliably."""
         return self._update(
@@ -89,6 +92,23 @@ class JobService:
             profile_version=assessment.profile_version,
             rubric_version=assessment.rubric_version,
             prompt_version=assessment.prompt_version,
+            evaluation_run_id=evaluation_run_id,
+        )
+
+    def mark_out_of_scope(self, source_job_id: str, reason: str) -> JobMirrorRecord:
+        """Keep an unrelated posting in the tracker without assigning fit scores."""
+        if not reason.strip():
+            raise ValueError("Out-of-scope classification requires a reason")
+        return self._update(
+            source_job_id,
+            {
+                "skill_stack_fit": None,
+                "semantic_experience_fit": None,
+                "overall_fit": None,
+                "fit_category": None,
+                "fit_explanation": reason,
+                "fit_status": "OutOfScope",
+            },
         )
 
     def _update(
@@ -100,6 +120,7 @@ class JobService:
         profile_version: int | None = None,
         rubric_version: str | None = None,
         prompt_version: str | None = None,
+        evaluation_run_id: str | None = None,
     ) -> JobMirrorRecord:
         row = self._repository.update_job_fields(
             source_job_id,
@@ -108,6 +129,7 @@ class JobService:
             profile_version=profile_version,
             rubric_version=rubric_version,
             prompt_version=prompt_version,
+            evaluation_run_id=evaluation_run_id,
         )
         if row is None:
             raise JobNotFoundError(source_job_id)
