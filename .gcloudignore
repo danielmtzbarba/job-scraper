@@ -1,0 +1,18 @@
+.gcloudignore
+.git/
+#!include:.gitignore
+
+# Never upload local credentials, job data, or private profiles.
+.env
+.env.*
+.local/
+.venv/
+data/
+profiles/
+
+# Build input is limited to the application and its lockfile.
+tests/
+docs/
+state.md
+CONTEXT.md
+AGENTS.md
