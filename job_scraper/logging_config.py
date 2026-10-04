@@ -22,6 +22,9 @@ _SENSITIVE_PARTS = (
     "credential",
     "cookie",
 )
+_NUMERIC_TOKEN_FIELDS = frozenset({
+    "prompt_tokens", "candidate_tokens", "thought_tokens",
+})
 _LEVEL_COLORS = {
     "INFO": "\033[32m",
     "WARNING": "\033[33m",
@@ -97,7 +100,9 @@ def _format_value(value: Any) -> str:
 def _scrub_sensitive_fields(
     _logger: Any, _method_name: str, event_dict: dict[str, Any]
 ) -> dict[str, Any]:
-    for key in event_dict:
+    for key, value in event_dict.items():
+        if key in _NUMERIC_TOKEN_FIELDS and (value is None or type(value) is int):
+            continue
         if any(part in key.lower() for part in _SENSITIVE_PARTS):
             event_dict[key] = "[REDACTED]"
     return event_dict

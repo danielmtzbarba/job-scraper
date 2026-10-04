@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Annotated, Callable, Literal
 
 from dotenv import load_dotenv
+
+# Load SSL_CERT_FILE before Cloud SQL's aiohttp dependency is imported.
+load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
+
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver import Context
@@ -62,7 +66,6 @@ class ServerContext:
 @asynccontextmanager
 async def _server_lifespan(_server: MCPServer) -> AsyncIterator[ServerContext]:
     project_root = Path(__file__).resolve().parents[2]
-    load_dotenv(project_root / ".env", override=False)
     repository = create_repository(project_root)
     repository.initialize()
     profile_dir = Path(os.getenv("JOB_SCRAPER_PROFILE_DIR", ".local/profiles")).expanduser()

@@ -8,6 +8,10 @@ from typing import TypeVar
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
+import structlog
+
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -43,16 +47,26 @@ class VertexModelClient:
         )
 
     def generate(self, prompt: str, schema: type[ResponseSchema]) -> ModelResponse:
-        response = self._client.models.generate_content(
+        chat = self._client.chats.create(
             model=self.model_id,
-            contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=schema,
                 temperature=0,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True
+                ),
             ),
         )
+        response = chat.send_message(prompt)
         usage = response.usage_metadata
+        logger.info(
+            "vertex_request_completed",
+            model_id=self.model_id,
+            prompt_tokens=usage.prompt_token_count if usage else None,
+            candidate_tokens=usage.candidates_token_count if usage else None,
+            thought_tokens=usage.thoughts_token_count if usage else None,
+        )
         return ModelResponse(
             text=response.text,
             prompt_tokens=usage.prompt_token_count if usage else None,

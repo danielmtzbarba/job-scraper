@@ -41,7 +41,7 @@ The IAM user has `USAGE` and `CREATE` on the `public` schema. This narrow grant 
 GRANT USAGE, CREATE ON SCHEMA public TO "deatheater.dm@gmail.com";
 ```
 
-All eight application tables and their indexes were created and verified. Starting the API or scoring CLI checks that schema on startup. The local Python installation also needed a CA bundle for the connector's Google API call; if you see a certificate verification error, set `SSL_CERT_FILE` to the path reported by `python -c 'import certifi; print(certifi.where())'`.
+All eight application tables and their indexes were created and verified. Starting the API or scoring CLI checks that the tables exist; schema creation stays with the table owner rather than the restricted runtime identity. The Cloud Run service account `job-scraper-run@jobsearch-danielmtz-2026.iam.gserviceaccount.com` uses database username `job-scraper-run@jobsearch-danielmtz-2026.iam` in `CLOUD_SQL_IAM_USER`. It has the Cloud SQL Client and Instance User IAM roles and `SELECT, INSERT, UPDATE, DELETE` on the eight existing application tables, without schema creation rights. A keyless connection and application initialization succeeded as that identity. On Python installations without a usable system CA bundle, put `SSL_CERT_FILE` in the ignored `.env` and set it to the absolute path printed by `.venv/bin/python -c 'import certifi; print(certifi.where())'`. The API and CLI load this setting before importing the Cloud SQL connector, which is necessary because its `aiohttp` dependency creates a TLS context at import time. Certificate verification stays enabled.
 
 On 2026-10-04, the one-time import copied and verified 714 jobs, 775 processing records, 24 score provenance records, 714 source aliases, and 7 search runs from `.local/jobs.db`. It maps old `ReadyToSync`/`Synced` processing states to `Completed` and omits Airtable-only sync fields. The SQLite file remains intact. To preview or repeat the import after configuring the Cloud SQL variables above:
 
@@ -130,11 +130,19 @@ The versioned rubric and prompt are defined in `job_scraper/application/scoring_
 
 ### Classification after enrichment
 
-Once detail enrichment saves a canonical job, it queues classification. An external application link is optional. Filtered jobs, merged duplicates, and unresolved possible duplicates are not queued. When `JOB_SCRAPER_AUTO_CLASSIFY=1`, the FastAPI process starts a separate worker thread that claims these newly enriched jobs and calls Vertex AI without holding a request or database transaction open. It stores the selected profile, version, reason, and evaluation run in `job_classifications`. A match becomes ready for scoring while keeping Fit Status `Pending`; a clear nonmatch becomes `OutOfScope` and skips scoring. Failures retry up to three claims with delays. This flag defaults to off, and existing jobs are not queued retroactively when the new table is created.
+Once detail enrichment saves a canonical job, it queues classification. An external application link is optional. Filtered jobs, merged duplicates, and unresolved possible duplicates are not queued. When `JOB_SCRAPER_AUTO_CLASSIFY=1`, the FastAPI process starts a separate worker thread. Every 15 seconds, it claims at most one unclassified `Pending` canonical job, newest posting first, and calls Vertex AI without holding a request or database transaction open. Jobs imported before the worker was enabled are eligible even if they have no `job_classifications` row; the claim creates that row atomically. It stores the selected profile, version, reason, and evaluation run. A match becomes ready for scoring while keeping Fit Status `Pending`; a clear nonmatch becomes `OutOfScope` and skips scoring. Failed calls retry up to three claims with delays. The flag defaults to off, so no classification calls begin merely because the code changed.
 
 Set the project, location, model, `JOB_SCRAPER_INPUT_PRICE_PER_MILLION`, and `JOB_SCRAPER_OUTPUT_PRICE_PER_MILLION` in the ignored `.env` before enabling the worker. The server does not expose a classification trigger through REST or MCP.
 
 ### Triggered Vertex AI scoring
+
+To check the configured Vertex AI project, region, model, and local credentials through the API, start the service and make one synthetic request:
+
+```sh
+curl --fail-with-body -X POST http://127.0.0.1:8000/vertex/smoke-test
+```
+
+The response reports `status`, `project`, `location`, `model`, and token counts. This is a small billed model call; it sends no job description or personal profile and does not read or update jobs. If the model call fails, the endpoint returns HTTP 502 and logs the error type. Restart an API process that was started before this route was added.
 
 The scoring CLI runs only when invoked. Preview the eligible jobs without making model calls:
 

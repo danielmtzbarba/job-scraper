@@ -13,6 +13,11 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
+
+# aiohttp builds its default TLS context during import. Load the local CA path
+# before importing integrations that use it (Cloud SQL in particular).
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
+
 import httpx
 from curl_cffi.requests import AsyncSession
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -54,6 +59,20 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 BLOCKED_STATUS_CODES = {403, 429, 503}
+
+
+class VertexSmokeReply(BaseModel):
+    ok: bool
+
+
+class VertexSmokeResponse(BaseModel):
+    status: Literal["ok"]
+    project: str
+    location: str
+    model: str
+    prompt_tokens: int | None
+    candidate_tokens: int | None
+    thought_tokens: int | None
 
 
 def _profile_dir() -> Path:
@@ -137,9 +156,13 @@ async def detail_fetcher_cron(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    load_dotenv(override=False)
     repository = create_repository(PROJECT_ROOT)
-    repository.initialize()
+    try:
+        repository.initialize()
+    except BaseException:
+        if hasattr(repository, "close"):
+            repository.close()
+        raise
     app.state.jobs = repository
     app.state.profiles = ProfileStore(_profile_dir())
     classification_settings = _classification_settings()
@@ -163,7 +186,7 @@ async def lifespan(app: FastAPI):
             repository, app.state.profiles, classification_model, classification_settings
         )
         classification_task = asyncio.create_task(asyncio.to_thread(
-            classification_loop, classifier, classification_stop, 10
+            classification_loop, classifier, classification_stop, 15
         ))
     try:
         async with mcp_server.session_manager.run():
@@ -285,6 +308,45 @@ def _validate_ba_url(url: str) -> None:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "storage": os.getenv("JOB_SCRAPER_STORAGE", "sqlite")}
+
+
+@app.post("/vertex/smoke-test", response_model=VertexSmokeResponse)
+def vertex_smoke_test() -> VertexSmokeResponse:
+    """Make one synthetic Vertex call without reading or changing job data."""
+    project = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+    location = os.getenv("GOOGLE_CLOUD_LOCATION", "")
+    model = os.getenv("JOB_SCRAPER_VERTEX_MODEL", "")
+    if not all((project, location, model)):
+        raise HTTPException(status_code=503, detail="Vertex AI project, location, and model must be configured.")
+
+    client = None
+    try:
+        client = VertexModelClient(project_id=project, location=location, model_id=model)
+        response = client.generate(
+            'Synthetic connectivity test. Return {"ok": true}.',
+            VertexSmokeReply,
+        )
+        if not VertexSmokeReply.model_validate_json(response.text or "").ok:
+            raise ValueError("Vertex AI did not confirm the smoke test")
+    except Exception as exc:
+        logger.exception("vertex_smoke_test_failed", error_type=type(exc).__name__)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Vertex AI smoke test failed ({type(exc).__name__}); check server logs.",
+        ) from exc
+    finally:
+        if client is not None:
+            client.close()
+
+    return VertexSmokeResponse(
+        status="ok",
+        project=project,
+        location=location,
+        model=model,
+        prompt_tokens=response.prompt_tokens,
+        candidate_tokens=response.candidate_tokens,
+        thought_tokens=response.thought_tokens,
+    )
 
 
 @app.get("/searches")

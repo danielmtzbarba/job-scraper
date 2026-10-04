@@ -12,6 +12,9 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+# Set the local CA bundle before the Cloud SQL connector imports aiohttp.
+load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
+
 from job_scraper.storage.postgres_jobs import PostgresJobRepository, _Connection
 
 
@@ -139,7 +142,6 @@ def import_sqlite(
 
 
 def main() -> None:
-    load_dotenv(PROJECT_ROOT / ".env", override=False)
     parser = argparse.ArgumentParser(description="Import SQLite jobs into empty Cloud SQL tables")
     parser.add_argument("--sqlite-path", type=Path, default=PROJECT_ROOT / ".local/jobs.db")
     parser.add_argument("--apply", action="store_true", help="Import and verify in one transaction")

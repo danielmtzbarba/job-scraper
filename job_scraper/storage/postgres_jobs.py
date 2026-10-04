@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from importlib.resources import files
 from typing import Any, Iterator
 
 from google.cloud.sql.connector import Connector
 
 from job_scraper.storage.sqlite_jobs import SQLiteJobRepository, _stale_processing_cutoff, _utc_now
+
+
+_REQUIRED_TABLES = frozenset({
+    "jobs", "job_processing", "fit_assessment_provenance", "source_aliases",
+    "possible_duplicates", "search_runs", "evaluation_runs", "job_classifications",
+})
 
 
 class _Row(dict[str, Any]):
@@ -104,9 +109,16 @@ class PostgresJobRepository(SQLiteJobRepository):
             raw.close()
 
     def initialize(self) -> None:
-        schema = files("job_scraper.storage").joinpath("postgres_schema.sql").read_text()
         with self._connect() as connection:
-            connection.executescript(schema)
+            rows = connection.execute(
+                "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public'"
+            ).fetchall()
+            missing = _REQUIRED_TABLES - {row["tablename"] for row in rows}
+            if missing:
+                raise RuntimeError(
+                    "Cloud SQL schema is incomplete; provision these tables before startup: "
+                    + ", ".join(sorted(missing))
+                )
             stale_before = _stale_processing_cutoff()
             connection.execute(
                 "UPDATE job_processing SET processing_status = 'Pending' "

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Protocol, TypeVar
+from typing import Generic, Protocol, TypeVar
 
 from pydantic import BaseModel
+import structlog
 
 from job_scraper.integrations.vertex_ai import ModelResponse
 from job_scraper.models.jobs import JobMirrorRecord
@@ -14,6 +15,7 @@ from job_scraper.models.profiles import ScoringProfile
 from job_scraper.storage.sqlite_jobs import SQLiteJobRepository
 
 Output = TypeVar("Output", bound=BaseModel)
+logger = structlog.get_logger(__name__)
 
 
 class StructuredModel(Protocol):
@@ -38,6 +40,14 @@ class ScoringSettings:
             raise ValueError("Positive input and output token prices are required")
 
 
+@dataclass(frozen=True)
+class EvaluationOutcome(Generic[Output]):
+    result: Output
+    evaluation_run_id: str
+    response: ModelResponse
+    estimated_cost_usd: float | None
+
+
 class ModelEvaluator:
     def __init__(
         self, repository: SQLiteJobRepository, model: StructuredModel, settings: ScoringSettings
@@ -58,7 +68,7 @@ class ModelEvaluator:
         profile: ScoringProfile | None = None,
         rubric_version: str | None = None,
         prompt_version: str | None = None,
-    ) -> tuple[Output, str]:
+    ) -> EvaluationOutcome[Output]:
         settings = self.settings
         run_id = self.repository.start_evaluation_run(
             batch_id=batch_id,
@@ -83,26 +93,39 @@ class ModelEvaluator:
                 raise ValueError("Model returned no text")
             result = schema.model_validate_json(response.text)
         except Exception as exc:
+            estimated_cost_usd = _estimated_cost(response, settings) if response else None
             self.repository.finish_evaluation_run(
                 run_id,
                 status="Failed",
                 prompt_tokens=response.prompt_tokens if response else None,
                 candidate_tokens=response.candidate_tokens if response else None,
                 thought_tokens=response.thought_tokens if response else None,
-                estimated_cost_usd=_estimated_cost(response, settings) if response else None,
+                estimated_cost_usd=estimated_cost_usd,
+                error_type=type(exc).__name__,
+            )
+            logger.warning(
+                "model_evaluation_failed",
+                stage=stage,
+                source_job_id=job.source_job_id,
+                evaluation_run_id=run_id,
+                prompt_tokens=response.prompt_tokens if response else None,
+                candidate_tokens=response.candidate_tokens if response else None,
+                thought_tokens=response.thought_tokens if response else None,
+                estimated_cost_usd=estimated_cost_usd,
                 error_type=type(exc).__name__,
             )
             raise
+        estimated_cost_usd = _estimated_cost(response, settings)
         self.repository.finish_evaluation_run(
             run_id,
             status="Completed",
             prompt_tokens=response.prompt_tokens,
             candidate_tokens=response.candidate_tokens,
             thought_tokens=response.thought_tokens,
-            estimated_cost_usd=_estimated_cost(response, settings),
+            estimated_cost_usd=estimated_cost_usd,
             result=result.model_dump(mode="json"),
         )
-        return result, run_id
+        return EvaluationOutcome(result, run_id, response, estimated_cost_usd)
 
 
 def _estimated_cost(response: ModelResponse, settings: ScoringSettings) -> float | None:

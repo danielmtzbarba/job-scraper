@@ -184,15 +184,28 @@ class TriggeredScoringTest(unittest.TestCase):
             )["status"], "Pending",
         )
 
-    def test_initialize_does_not_queue_existing_backlog(self) -> None:
+    def test_classifies_existing_backlog_one_job_per_cycle(self) -> None:
         self.add_job("old", "Backend engineer", "2026-09-01")
+        self.add_job("new", "Backend engineer", "2026-10-01")
         with sqlite3.connect(self.repository.database_path) as connection:
             connection.execute("DELETE FROM job_classifications")
         self.repository.initialize()
         self.assertIsNone(self.repository.get_classification(
             "Agentur für Arbeit", "arbeitsagentur:old"
         ))
-        self.assertEqual(self.repository.preview_pending_scoring_jobs(10), [])
+        classifier = ClassificationWorker(
+            self.repository, FakeProfiles(), FakeModel(), self.settings
+        )
+        self.assertEqual(classifier.run_once(), "Classified")
+        self.assertEqual(
+            self.repository.get_classification("Agentur für Arbeit", "arbeitsagentur:new")["status"],
+            "Classified",
+        )
+        self.assertIsNone(self.repository.get_classification(
+            "Agentur für Arbeit", "arbeitsagentur:old"
+        ))
+        self.assertEqual(classifier.run_once(), "Classified")
+        self.assertEqual(classifier.run_once(), None)
 
     def test_profile_version_change_requeues_classification(self) -> None:
         self.add_job("one", "Backend engineer", "2026-10-01")

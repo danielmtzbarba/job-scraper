@@ -677,8 +677,8 @@ class SQLiteJobRepository:
                     )
                     return candidate.model_dump(mode="json")
             mirror = self._upsert_mirror(connection, merged.to_mirror_record())
-            # Only newly enriched canonical jobs enter automatic classification.
-            # Existing jobs are intentionally not backfilled on API startup.
+            # Newly enriched jobs get a queue row immediately. The classifier
+            # also discovers older Pending jobs without a queue row when enabled.
             if existing_job is None and mirror.fit_status == "Pending":
                 now = _utc_now()
                 connection.execute(
@@ -898,31 +898,42 @@ class SQLiteJobRepository:
         return [self._row_to_record(dict(row)).model_dump(mode="json") for row in rows]
 
     def claim_next_classification_job(self) -> dict[str, Any] | None:
-        """Claim one newly enriched canonical job; never scan the old backlog."""
+        """Claim one Pending job without a completed classification."""
         now = _utc_now()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """SELECT j.*, c.attempts FROM job_classifications AS c
-                   JOIN jobs AS j ON j.source = c.source
+                """SELECT j.*, c.attempts FROM jobs AS j
+                   LEFT JOIN job_classifications AS c ON j.source = c.source
                     AND j.deduplication_key = c.deduplication_key
-                   WHERE c.status = 'Pending' AND c.attempts < 3
-                     AND j.fit_status = 'Pending'
-                     AND (c.next_retry_at IS NULL OR c.next_retry_at <= ?)
+                   WHERE j.fit_status = 'Pending'
+                     AND (c.source IS NULL OR (c.status = 'Pending'
+                       AND c.attempts < 3
+                       AND (c.next_retry_at IS NULL OR c.next_retry_at <= ?)))
                    ORDER BY (j.posted_at IS NULL), j.posted_at DESC,
-                            c.created_at DESC, c.deduplication_key
+                            COALESCE(c.created_at, '') DESC,
+                            j.source, j.deduplication_key
                    LIMIT 1""",
                 (now,),
             ).fetchone()
             if row is None:
                 return None
-            connection.execute(
-                """UPDATE job_classifications SET status = 'Running',
-                     attempts = attempts + 1, claimed_at = ?, updated_at = ?,
-                     next_retry_at = NULL, error_type = NULL
-                   WHERE source = ? AND deduplication_key = ?""",
-                (now, now, row["source"], row["deduplication_key"]),
-            )
+            if row["attempts"] is None:
+                connection.execute(
+                    """INSERT INTO job_classifications
+                       (source, deduplication_key, status, attempts,
+                        claimed_at, created_at, updated_at)
+                       VALUES (?, ?, 'Running', 1, ?, ?, ?)""",
+                    (row["source"], row["deduplication_key"], now, now, now),
+                )
+            else:
+                connection.execute(
+                    """UPDATE job_classifications SET status = 'Running',
+                         attempts = attempts + 1, claimed_at = ?, updated_at = ?,
+                         next_retry_at = NULL, error_type = NULL
+                       WHERE source = ? AND deduplication_key = ?""",
+                    (now, now, row["source"], row["deduplication_key"]),
+                )
             result = self._row_to_record(dict(row)).model_dump(mode="json")
             result["_classification_claimed_at"] = now
             return result

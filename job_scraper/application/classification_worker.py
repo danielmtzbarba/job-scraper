@@ -1,10 +1,11 @@
-"""Server-owned classification of newly enriched canonical jobs."""
+"""Server-owned classification of unclassified canonical jobs."""
 
 from __future__ import annotations
 
-import logging
 from threading import Event
 from uuid import uuid4
+
+import structlog
 
 from job_scraper.application.classification import (
     CLASSIFIER_PROMPT_VERSION,
@@ -16,7 +17,7 @@ from job_scraper.models.jobs import JobMirrorRecord
 from job_scraper.models.scoring import ProfileClassification
 from job_scraper.storage.sqlite_jobs import SQLiteJobRepository
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class ClassificationWorker:
@@ -42,8 +43,9 @@ class ClassificationWorker:
             return None
         claimed_at = row.pop("_classification_claimed_at")
         job = JobMirrorRecord.model_validate(row)
+        logger.info("classification_started", source_job_id=job.source_job_id)
         try:
-            result, evaluation_run_id = self.evaluator.call(
+            evaluation = self.evaluator.call(
                 job,
                 batch_id=str(uuid4()),
                 stage="classification",
@@ -51,6 +53,7 @@ class ClassificationWorker:
                 schema=ProfileClassification,
                 classifier_prompt_version=CLASSIFIER_PROMPT_VERSION,
             )
+            result = evaluation.result
             profile = by_id[result.profile_id] if result.profile_id else None
             self.repository.complete_classification(
                 source=job.source,
@@ -60,12 +63,12 @@ class ClassificationWorker:
                 profile_version=profile.version if profile else None,
                 reason=result.reason,
                 classifier_prompt_version=CLASSIFIER_PROMPT_VERSION,
-                evaluation_run_id=evaluation_run_id,
+                evaluation_run_id=evaluation.evaluation_run_id,
             )
             logger.info(
                 "classification_completed",
-                extra={"source_job_id": job.source_job_id, "status":
-                       "Classified" if profile else "OutOfScope"},
+                evaluation_run_id=evaluation.evaluation_run_id,
+                estimated_cost_usd=evaluation.estimated_cost_usd,
             )
             return "Classified" if profile else "OutOfScope"
         except Exception as exc:
@@ -74,16 +77,19 @@ class ClassificationWorker:
             )
             logger.warning(
                 "classification_failed",
-                extra={"source_job_id": job.source_job_id, "error_type": type(exc).__name__},
+                source_job_id=job.source_job_id,
+                error_type=type(exc).__name__,
             )
             return "Failed"
 
 
 def classification_loop(worker: ClassificationWorker, stop: Event, poll_seconds: int) -> None:
     """Run in a dedicated thread so Vertex calls never block FastAPI requests."""
+    logger.info("classification_worker_started", poll_seconds=poll_seconds)
     while not stop.is_set():
         try:
             worker.run_once()
         except Exception:
             logger.exception("classification_worker_iteration_failed")
         stop.wait(poll_seconds)
+    logger.info("classification_worker_stopped")

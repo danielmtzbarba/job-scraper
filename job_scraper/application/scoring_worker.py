@@ -11,6 +11,10 @@ from pathlib import Path
 from uuid import uuid4
 
 from dotenv import load_dotenv
+import structlog
+
+# aiohttp creates its TLS context at import time, before main() runs.
+load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 
 from job_scraper.application.jobs import JobService
 from job_scraper.application.model_evaluation import ModelEvaluator, ScoringSettings, StructuredModel
@@ -21,6 +25,7 @@ from job_scraper.application.scoring_prompt import (
     render_scoring_prompt,
 )
 from job_scraper.integrations.vertex_ai import VertexModelClient
+from job_scraper.logging_config import setup_logging
 from job_scraper.models.jobs import JobMirrorRecord
 from job_scraper.models.scoring import (
     FitAssessment,
@@ -32,6 +37,7 @@ from job_scraper.storage.repository import create_repository
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+logger = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -81,7 +87,7 @@ class ScoringWorker:
                     self.repository.requeue_classification(job.source, job.deduplication_key)
                     summary.reclassification_requested += 1
                     continue
-                result, scoring_run_id = self.evaluator.call(
+                evaluation = self.evaluator.call(
                     job,
                     batch_id=summary.batch_id,
                     stage="scoring",
@@ -91,6 +97,7 @@ class ScoringWorker:
                     rubric_version=RUBRIC_VERSION,
                     prompt_version=PROMPT_VERSION,
                 )
+                result = evaluation.result
                 if result.decision == "needs_review":
                     self.jobs.mark_fit_needs_review(
                         job.source_job_id,
@@ -101,7 +108,7 @@ class ScoringWorker:
                             prompt_version=PROMPT_VERSION,
                             review_reason=result.review_reason,
                         ),
-                        evaluation_run_id=scoring_run_id,
+                        evaluation_run_id=evaluation.evaluation_run_id,
                     )
                     summary.needs_review += 1
                 else:
@@ -126,16 +133,27 @@ class ScoringWorker:
                             fit_category=category,
                             fit_explanation=result.fit_explanation,
                         ),
-                        evaluation_run_id=scoring_run_id,
+                        evaluation_run_id=evaluation.evaluation_run_id,
                     )
                     summary.scored += 1
+                logger.info(
+                    "scoring_completed",
+                    source_job_id=job.source_job_id,
+                    status="NeedsReview" if result.decision == "needs_review" else "Scored",
+                    evaluation_run_id=evaluation.evaluation_run_id,
+                    prompt_tokens=evaluation.response.prompt_tokens,
+                    candidate_tokens=evaluation.response.candidate_tokens,
+                    thought_tokens=evaluation.response.thought_tokens,
+                    estimated_cost_usd=evaluation.estimated_cost_usd,
+                )
             except Exception as exc:
                 # Model failures have an evaluation record. Persistence errors
                 # leave the job Pending for a later user-triggered retry.
                 summary.failed += 1
-                print(
-                    json.dumps({"job_id": job.source_job_id, "error_type": type(exc).__name__}),
-                    file=sys.stderr,
+                logger.warning(
+                    "scoring_failed",
+                    source_job_id=job.source_job_id,
+                    error_type=type(exc).__name__,
                 )
             finally:
                 self.repository.release_scoring_claim(job.source, job.deduplication_key, claimed_at)
@@ -146,7 +164,7 @@ class ScoringWorker:
 
 def main() -> None:
     """Run only on an explicit command; API startup never starts scoring."""
-    load_dotenv(PROJECT_ROOT / ".env", override=False)
+    setup_logging("job-scraper-score", stream=sys.stderr)
     parser = argparse.ArgumentParser(description="Score up to 10 newest classified Pending jobs")
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--dry-run", action="store_true", help="List jobs without model calls or claims")
