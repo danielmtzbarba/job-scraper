@@ -63,6 +63,11 @@ class _Connection:
             if statement.strip():
                 self.execute(statement)
 
+    def executemany(self, sql: str, rows: list[tuple[Any, ...]]) -> _Cursor:
+        cursor = self.raw.cursor()
+        cursor.executemany(sql.replace("?", "%s"), rows)
+        return _Cursor(cursor)
+
 
 class PostgresJobRepository(SQLiteJobRepository):
     """Run the shared job operations against Cloud SQL with IAM login."""

@@ -29,3 +29,4 @@ packages = ["job_scraper"]
 [project.scripts]
 job-scraper-mcp = "job_scraper.mcp.server:main"
 job-scraper-score = "job_scraper.application.scoring_worker:main"
+job-scraper-import-sqlite = "job_scraper.storage.import_sqlite:main"

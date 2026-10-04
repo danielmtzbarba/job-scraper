@@ -294,6 +294,10 @@ class SQLiteJobRepository:
                 (stale_before,),
             )
             connection.execute(
+                "UPDATE job_processing SET processing_status = 'Completed' "
+                "WHERE processing_status IN ('ReadyToSync', 'Synced')"
+            )
+            connection.execute(
                 "UPDATE job_processing SET airtable_sync_status = 'Pending' "
                 "WHERE airtable_sync_status = 'Processing' AND updated_at <= ?",
                 (stale_before,),
@@ -694,8 +698,7 @@ class SQLiteJobRepository:
             now = _utc_now()
             connection.execute(
                 """UPDATE job_processing SET payload_json = ?,
-                    processing_status = 'ReadyToSync', fetch_error = NULL,
-                    airtable_sync_status = 'Pending', airtable_sync_error = NULL,
+                    processing_status = 'Completed', fetch_error = NULL,
                     updated_at = ? WHERE source = ? AND deduplication_key = ?""",
                 (merged.model_dump_json(), now, detail.source, staged.deduplication_key),
             )
@@ -807,7 +810,7 @@ class SQLiteJobRepository:
                 canonical_source, canonical_key = selected["possible_source"], selected["possible_key"]
             else:
                 result = self._upsert_mirror(connection, payload.to_mirror_record()).model_dump(mode="json")
-                status = "ReadyToSync"
+                status = "Completed"
                 canonical_source, canonical_key = source, deduplication_key
             connection.execute(
                 """INSERT INTO source_aliases
@@ -936,7 +939,7 @@ class SQLiteJobRepository:
         classifier_prompt_version: str,
         evaluation_run_id: str,
     ) -> None:
-        """Save the current selection and any OutOfScope Airtable patch atomically."""
+        """Save the current selection and any OutOfScope job update atomically."""
         if not reason.strip() or (profile_id is None) != (profile_version is None):
             raise ValueError("Classification requires a reason and a paired profile/version")
         now = _utc_now()
@@ -972,27 +975,6 @@ class SQLiteJobRepository:
                          overall_fit = NULL, fit_category = NULL, fit_explanation = ?
                        WHERE source = ? AND deduplication_key = ?""",
                     (reason, source, deduplication_key),
-                )
-                processing = connection.execute(
-                    """SELECT airtable_pending_fields_json FROM job_processing
-                       WHERE source = ? AND deduplication_key = ?""",
-                    (source, deduplication_key),
-                ).fetchone()
-                if processing is None:
-                    raise RuntimeError("Classification has no processing row")
-                pending = json.loads(processing["airtable_pending_fields_json"] or "{}")
-                pending.update({
-                    "Fit Status": "OutOfScope", "Fit Explanation": reason,
-                    "Skill/Stack Fit": None, "Semantic Experience Fit": None,
-                    "Overall Fit": None, "Fit Category": None,
-                })
-                connection.execute(
-                    """UPDATE job_processing SET airtable_pending_fields_json = ?,
-                         airtable_sync_status = 'Pending', airtable_sync_error = NULL,
-                         airtable_next_retry_at = NULL, updated_at = ?
-                       WHERE source = ? AND deduplication_key = ?""",
-                    (json.dumps(pending, ensure_ascii=False), now,
-                     source, deduplication_key),
                 )
                 connection.execute(
                     """DELETE FROM fit_assessment_provenance
@@ -1224,7 +1206,7 @@ class SQLiteJobRepository:
         prompt_version: str | None = None,
         evaluation_run_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """Update user-managed job fields and queue their Airtable patch."""
+        """Update user-managed job fields and score provenance."""
         allowed_fields = {
             "application_status",
             "application_notes",
@@ -1258,15 +1240,13 @@ class SQLiteJobRepository:
             updated = JobMirrorRecord.model_validate(
                 {**existing.model_dump(), **fields}
             )
-            pending_row = connection.execute(
-                "SELECT airtable_pending_fields_json FROM job_processing "
+            processing_row = connection.execute(
+                "SELECT 1 FROM job_processing "
                 "WHERE source = ? AND source_job_id = ?",
                 (_SOURCE, source_job_id),
             ).fetchone()
-            if pending_row is None:
-                raise RuntimeError(
-                    "Job has no processing row; cannot queue its Airtable update."
-                )
+            if processing_row is None:
+                raise RuntimeError("Job has no processing row")
 
             serialized = updated.model_dump(mode="json")
             assignments: list[str] = []
@@ -1284,23 +1264,10 @@ class SQLiteJobRepository:
                 values,
             )
 
-            pending_fields = json.loads(
-                pending_row["airtable_pending_fields_json"] or "{}"
-            )
-            for name in fields:
-                alias = JobMirrorRecord.model_fields[name].alias or name
-                pending_fields[alias] = serialized[name]
             connection.execute(
-                """UPDATE job_processing SET airtable_pending_fields_json = ?,
-                    processing_status = 'ReadyToSync', airtable_sync_status = 'Pending',
-                    airtable_sync_error = NULL, airtable_next_retry_at = NULL,
+                """UPDATE job_processing SET processing_status = 'Completed',
                     updated_at = ? WHERE source = ? AND source_job_id = ?""",
-                (
-                    json.dumps(pending_fields, ensure_ascii=False),
-                    _utc_now(),
-                    _SOURCE,
-                    source_job_id,
-                )
+                (_utc_now(), _SOURCE, source_job_id),
             )
             if profile_id is not None and profile_version is not None:
                 connection.execute(
@@ -1361,7 +1328,7 @@ class SQLiteJobRepository:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _normalized_text(value: str | None) -> str:

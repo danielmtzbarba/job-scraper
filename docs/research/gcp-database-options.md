@@ -1,5 +1,7 @@
 # Google Cloud database options for the job tracker
 
+**Historical research:** This was written before the Cloud SQL decision and provisioning. The current decision and live resource inventory are in [architecture.md](../architecture.md); the "do not create" conclusion below is superseded.
+
 Checked 2026-10-04 against Google documentation. Prices are public USD list prices and can vary by region and billing currency. No database resource was created.
 
 ## Conventional Cloud SQL for PostgreSQL

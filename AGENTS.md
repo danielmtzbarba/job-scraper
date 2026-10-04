@@ -2,7 +2,7 @@
 
 ## Project purpose
 
-This repository is for a Python job discovery and tracking application built around Google Cloud, Vertex AI, and Gemini. The intended design includes an MCP server, Apify for job-source collection, and Airtable as a results tracker. The user has concluded brainstorming and authorized local-first implementation. GCP resource creation and deployment are not yet authorized; establish and verify the local application before cloud work.
+This repository is for a Python job discovery and tracking application built around Google Cloud, Vertex AI, and Gemini. The local application includes an MCP server and an Agentur für Arbeit collector; Apify remains a future source integration. SQLite is the local debugging store and Cloud SQL PostgreSQL is the selected hosted tracker. Some GCP resources have been created with explicit user authorization, but no application service has been deployed. `docs/architecture.md` records the current decisions and GCP resource inventory.
 
 ## How to work in this repository
 
@@ -20,16 +20,16 @@ This repository is for a Python job discovery and tracking application built aro
 
 ## Current system boundaries
 
-- **Collection:** Apify is the planned source integration, prioritized LinkedIn, Agentur für Arbeit, Indeed, then englishjobs.de; validate actor availability, source terms, and cost before live runs.
-- **Local workflow:** Python owns normalization, deduplication, hard filters, and orchestration; Gemini on Vertex AI extracts/scorers/explains where language understanding helps.
-- **MCP interface:** remote GCP endpoint for the user's own ChatGPT/Codex sessions, with search/read and Airtable updates; verify transport/auth compatibility before implementation.
-- **Persistence/tracking:** Airtable holds jobs and application state. Private GCP storage holds versioned Markdown CV artifacts and their paired structured profiles.
-- **Hosting:** start locally. Cloud Run/Cloud Scheduler are candidates, not yet selected; no GCP resource creation or deployment until the user explicitly asks.
+- **Collection:** The local Agentur für Arbeit collector and scheduler are implemented. Apify is planned for later sources; validate Actor availability, source terms, and cost before live runs.
+- **Workflow:** Python owns normalization, deduplication, hard filters, and orchestration; Gemini on Vertex AI classifies, scores, and explains where language understanding helps.
+- **MCP interface:** Local Streamable HTTP is implemented. The future remote endpoint is for the user's own ChatGPT/Codex sessions, with search/read and database updates; verify transport and authentication before deployment.
+- **Persistence/tracking:** SQLite is the local debugging store. Cloud SQL PostgreSQL holds hosted jobs and application state; the one-time SQLite import is complete. Private Cloud Storage contains reviewed scoring profiles. Versioned Markdown CV storage is still open. Airtable is historical and its sync worker is disabled.
+- **Hosting:** A single always-on Cloud Run service is the selected deployment direction; it has not been launched. No additional GCP resource creation or deployment is authorized by the architecture document alone.
 
 ## Engineering expectations once implementation is authorized
 
 - Validate external inputs and handle retries, rate limits, and partial failures at service boundaries.
-- Make collection and Airtable writes idempotent where practical; retain source URLs and collection timestamps for traceability.
+- Make collection and database writes idempotent where practical; retain source URLs and collection timestamps for traceability.
 - Minimize stored personal data and respect source terms, access controls, and applicable policies.
 - Separate pure logic from integrations so normalization, matching, and deduplication can be reasoned about independently.
 - Develop in vertical slices and keep the first local workflow usable without live Apify, Airtable, Gmail, Slack, or GCP credentials.
