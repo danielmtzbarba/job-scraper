@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import re
+import socket
+import time
 from contextlib import contextmanager
 from typing import Any, Iterator
 
+from aiohttp import ClientConnectorError
 from google.cloud.sql.connector import Connector
+from pg8000.exceptions import InterfaceError
 
 from job_scraper.storage.sqlite_jobs import SQLiteJobRepository, _stale_processing_cutoff, _utc_now
 
@@ -14,6 +19,17 @@ _REQUIRED_TABLES = frozenset({
     "jobs", "job_processing", "fit_assessment_provenance", "source_aliases",
     "possible_duplicates", "search_runs", "evaluation_runs", "job_classifications",
 })
+
+_CONNECT_ATTEMPTS = 3
+
+
+def _is_transient_connect_error(exc: Exception) -> bool:
+    """Return whether opening a Cloud SQL connection can reasonably be retried."""
+    if isinstance(exc, (socket.gaierror, TimeoutError, ConnectionError, ClientConnectorError)):
+        return True
+    # pg8000 reports a dropped socket during its TLS/PostgreSQL handshake as an
+    # InterfaceError("network error"). Other interface errors may be permanent.
+    return isinstance(exc, InterfaceError) and "network error" in str(exc).lower()
 
 
 class _Row(dict[str, Any]):
@@ -52,13 +68,25 @@ class _Connection:
     def __init__(self, raw: Any) -> None:
         self.raw = raw
 
-    def execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> _Cursor:
+    def execute(
+        self, sql: str, parameters: tuple[Any, ...] | dict[str, Any] = ()
+    ) -> _Cursor:
         if sql.strip().upper() == "BEGIN IMMEDIATE":
             # The SQLite code serializes claim/read/write sequences. Keep that
             # invariant across app processes without holding a session lock.
             sql = "SELECT pg_advisory_xact_lock(7112026)"
-        else:
-            sql = sql.replace("?", "%s").replace(" LIKE ", " ILIKE ")
+        elif isinstance(parameters, dict):
+            # Shared repository SQL may use SQLite's :name bindings. pg8000's
+            # default format style requires positional %s parameters.
+            bound_values: list[Any] = []
+
+            def bind_named(match: re.Match[str]) -> str:
+                bound_values.append(parameters[match.group(1)])
+                return "%s"
+
+            sql = re.sub(r"(?<!:):([A-Za-z_]\w*)", bind_named, sql)
+            parameters = tuple(bound_values)
+        sql = sql.replace("?", "%s").replace(" LIKE ", " ILIKE ")
         cursor = self.raw.cursor()
         cursor.execute(sql, parameters)
         return _Cursor(cursor)
@@ -92,13 +120,26 @@ class PostgresJobRepository(SQLiteJobRepository):
 
     @contextmanager
     def _connect(self) -> Iterator[_Connection]:
-        raw = self._get_connector().connect(
-            self.instance_connection_name,
-            "pg8000",
-            user=self.user,
-            db=self.database,
-            enable_iam_auth=True,
-        )
+        raw = None
+        for attempt in range(_CONNECT_ATTEMPTS):
+            try:
+                raw = self._get_connector().connect(
+                    self.instance_connection_name,
+                    "pg8000",
+                    user=self.user,
+                    db=self.database,
+                    enable_iam_auth=True,
+                )
+                break
+            except Exception as exc:
+                if attempt + 1 >= _CONNECT_ATTEMPTS or not _is_transient_connect_error(exc):
+                    raise
+                # The repository API is synchronous; keep this short, bounded
+                # backoff local to connection setup so workers can recover from
+                # brief DNS or network interruptions without failing an item.
+                time.sleep(0.5 * (2**attempt))
+        if raw is None:
+            raise RuntimeError("Cloud SQL connection attempts ended without a connection")
         try:
             yield _Connection(raw)
             raw.commit()

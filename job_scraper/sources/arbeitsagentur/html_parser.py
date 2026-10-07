@@ -90,14 +90,50 @@ def parse_html(html: str, source_url: str | None = None) -> list[JobPosting]:
 
     structured = _parse_json_ld(soup, page_url)
     if structured:
-        return _deduplicate(structured)
+        detail_posting = _detail_page_posting(structured, soup, page_url)
+        if detail_posting is not None:
+            return [detail_posting]
+        if not _job_id(page_url):
+            return _deduplicate(structured)
 
     cards = _parse_result_cards(soup, page_url)
     if cards:
-        return _deduplicate(cards)
+        detail_posting = _detail_page_posting(cards, soup, page_url)
+        if detail_posting is not None:
+            return [detail_posting]
+        if not _job_id(page_url):
+            return _deduplicate(cards)
 
     detail = _parse_detail_page(soup, page_url)
-    return [detail] if any((detail.title, detail.source_job_id, detail.job_description)) else []
+    return [detail] if any((detail.title, detail.company, detail.job_description)) else []
+
+
+def _detail_page_posting(
+    postings: list[JobPosting], soup: BeautifulSoup, page_url: str | None
+) -> JobPosting | None:
+    """Use the requested detail URL as identity for its matching page content."""
+    requested_id = _job_id(page_url)
+    if not requested_id:
+        return None
+
+    page_title = _meta_content(soup, "og:title") or _first_heading(soup)
+    page_title, _ = _split_ba_heading(page_title)
+    title_key = _fold(page_title)
+    matches = [posting for posting in postings if title_key and _fold(posting.title) == title_key]
+
+    # Detail pages normally expose one JobPosting object. If it does, the
+    # requested URL identifies that object even when BA's JSON-LD uses a
+    # different internal or legacy identifier. With multiple objects, require
+    # a heading/title match so recommendation cards aren't relabeled as the job.
+    if not matches and len(postings) == 1:
+        matches = postings
+    if not matches:
+        return None
+
+    posting = matches[0]
+    posting.source_job_id = requested_id
+    posting.job_url = _canonical_job_url(page_url, requested_id)
+    return posting
 
 
 def _safe_source_url(source_url: str | None) -> str | None:
