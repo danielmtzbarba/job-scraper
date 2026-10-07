@@ -434,6 +434,72 @@ class SQLiteJobRepository:
                 "SELECT * FROM search_runs ORDER BY started_at DESC, id DESC LIMIT ?", (limit,)
             )]
 
+    def get_workflow_status(self, slot_date: str) -> dict[str, Any]:
+        """Read the daily search ledger and current processing queues."""
+        with self._connect() as connection:
+            runs = [dict(row) for row in connection.execute(
+                """SELECT search_id, slot_date, started_at, finished_at, status,
+                          found, inserted, duplicate, skipped, error
+                   FROM search_runs WHERE slot_date = ? ORDER BY started_at""",
+                (slot_date,),
+            )]
+            processing = {row["processing_status"]: row["total"] for row in connection.execute(
+                """SELECT processing_status, COUNT(*) AS total
+                   FROM job_processing WHERE source = ? AND source_job_id IS NOT NULL
+                   GROUP BY processing_status""", (_SOURCE,)
+            )}
+            classifications = {row["status"]: row["total"] for row in connection.execute(
+                """SELECT status, COUNT(*) AS total
+                   FROM job_classifications GROUP BY status"""
+            )}
+            fit = {row["fit_status"]: row["total"] for row in connection.execute(
+                "SELECT fit_status, COUNT(*) AS total FROM jobs GROUP BY fit_status"
+            )}
+            unclassified = connection.execute(
+                """SELECT COUNT(*) AS total FROM jobs AS j
+                   LEFT JOIN job_classifications AS c
+                     ON c.source = j.source AND c.deduplication_key = j.deduplication_key
+                   WHERE j.fit_status = 'Pending' AND c.source IS NULL"""
+            ).fetchone()["total"]
+            scoring_ready = connection.execute(
+                """SELECT COUNT(*) AS total FROM jobs AS j
+                   JOIN job_classifications AS c
+                     ON c.source = j.source AND c.deduplication_key = j.deduplication_key
+                   WHERE j.fit_status = 'Pending' AND c.status = 'Classified'
+                     AND c.profile_id IS NOT NULL"""
+            ).fetchone()["total"]
+            issues = [dict(row) for row in connection.execute(
+                """SELECT 'detail' AS stage, source_job_id AS job_id,
+                          fetch_error AS error, updated_at AS occurred_at
+                   FROM job_processing WHERE processing_status = 'Failed'
+                     AND source = ? AND source_job_id IS NOT NULL
+                   ORDER BY updated_at DESC LIMIT 5""", (_SOURCE,)
+            )]
+            issues += [dict(row) for row in connection.execute(
+                """SELECT 'classification' AS stage, j.source_job_id AS job_id,
+                          c.error_type AS error, c.updated_at AS occurred_at
+                   FROM job_classifications AS c JOIN jobs AS j
+                     ON j.source = c.source AND j.deduplication_key = c.deduplication_key
+                   WHERE c.status = 'Failed' ORDER BY c.updated_at DESC LIMIT 5"""
+            )]
+            issues += [dict(row) for row in connection.execute(
+                """SELECT 'scoring' AS stage, j.source_job_id AS job_id,
+                          e.error_type AS error, e.finished_at AS occurred_at
+                   FROM evaluation_runs AS e JOIN jobs AS j
+                     ON j.source = e.source AND j.deduplication_key = e.deduplication_key
+                   WHERE e.stage = 'scoring' AND e.status = 'Failed'
+                   ORDER BY e.started_at DESC LIMIT 5"""
+            )]
+        return {
+            "runs": runs,
+            "processing": processing,
+            "classifications": classifications,
+            "fit": fit,
+            "unclassified": unclassified,
+            "scoring_ready": scoring_ready,
+            "issues": sorted(issues, key=lambda item: item["occurred_at"] or "", reverse=True)[:5],
+        }
+
     def claim_next_detail_job(self) -> str | None:
         """Claim the next BA staging row awaiting detail enrichment."""
         now = _utc_now()

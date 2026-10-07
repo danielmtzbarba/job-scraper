@@ -39,6 +39,7 @@ from job_scraper.application.profiles import ProfileStore
 from job_scraper.application.search_schedule import (
     SEARCH_BY_ID, SEARCHES, claim_search, execute_search, search_scheduler,
 )
+from job_scraper.application.workflow_status import workflow_status
 from job_scraper.integrations.vertex_ai import VertexModelClient
 from job_scraper.mcp.server import ServerContext, create_server
 from job_scraper.sources.arbeitsagentur.html_parser import JobPosting, parse_html
@@ -331,14 +332,6 @@ def health() -> dict[str, str]:
     return {"status": "ok", "storage": os.getenv("JOB_SCRAPER_STORAGE", "sqlite")}
 
 
-@app.get("/prototype/scored-jobs", include_in_schema=False)
-def scored_jobs_prototype() -> FileResponse:
-    """Throwaway UI prototype: compare three layouts for the top scored jobs."""
-    if os.getenv("K_SERVICE"):
-        raise HTTPException(status_code=404, detail="Prototype route is local only.")
-    return FileResponse(PROJECT_ROOT / "job_scraper" / "prototypes" / "scored_jobs.html")
-
-
 @app.get("/searches")
 def list_searches() -> list[dict[str, object]]:
     return [search.public_dict() for search in SEARCHES]
@@ -515,14 +508,27 @@ async def fetch_and_import_job_detail(
 
 # --- Standard Read Endpoints ---
 
+@app.get("/status", include_in_schema=False)
+def status_page() -> FileResponse:
+    return FileResponse(PROJECT_ROOT / "job_scraper" / "prototypes" / "status.html")
+
+
+@app.get("/api/status")
+def get_status(request: Request) -> dict[str, Any]:
+    return workflow_status(_repository(request))
+
+
 @app.get("/jobs", response_model=JobListResponse, response_model_by_alias=False)
+@app.get("/api/jobs", response_model=JobListResponse, response_model_by_alias=False)
 def list_jobs(
     request: Request,
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     source: str | None = None,
     fit_status: str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | FileResponse:
+    if request.url.path == "/jobs" and "text/html" in request.headers.get("accept", "").lower():
+        return FileResponse(PROJECT_ROOT / "job_scraper" / "prototypes" / "scored_jobs.html")
     jobs = _repository(request).list_jobs(
         limit=limit, offset=offset, source=source, fit_status=fit_status
     )

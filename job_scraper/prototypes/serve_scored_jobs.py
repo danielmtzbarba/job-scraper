@@ -22,11 +22,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         route = urlsplit(self.path)
-        if route.path in {"/", "/prototype/scored-jobs"}:
+        if route.path in {"/", "/jobs"}:
             body = (ROOT / "job_scraper/prototypes/scored_jobs.html").read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-        elif route.path == "/jobs":
+        elif route.path == "/api/jobs":
             params = parse_qs(route.query)
             limit = min(500, max(1, int(params.get("limit", ["500"])[0])))
             jobs = self.repository.list_jobs(
@@ -51,7 +51,7 @@ def main() -> None:
     repository.initialize()
     Handler.repository = repository
     server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
-    print("Scored jobs prototype: http://127.0.0.1:8765/prototype/scored-jobs")
+    print("Scored jobs prototype: http://127.0.0.1:8765/jobs")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
