@@ -53,6 +53,7 @@ def workflow_status(repository: SQLiteJobRepository, now: datetime | None = None
             "missed": sum(item["status"] == "Missed" for item in schedule),
             "runs": schedule,
         },
+        "applications": {"unapplied": data["applications"].get("Saved", 0)},
         "details": {
             "awaiting": processing.get("Pending", 0) + processing.get("Processing", 0),
             "failed": processing.get("Failed", 0),

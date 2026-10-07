@@ -46,6 +46,19 @@ class WorkflowStatusTest(unittest.TestCase):
         self.assertEqual(status["searches"]["runs"][0]["status"], "Stalled")
         self.assertGreaterEqual(status["attention_count"], 1)
 
+    def test_unapplied_count_only_includes_saved_jobs(self) -> None:
+        with self.repository._connect() as connection:
+            for key, application_status in (
+                ("saved", "Saved"), ("applied", "Applied"), ("ignored", "Ignored")
+            ):
+                connection.execute(
+                    """INSERT INTO jobs (source, deduplication_key, application_status)
+                       VALUES (?, ?, ?)""",
+                    ("Agentur für Arbeit", key, application_status),
+                )
+        status = workflow_status(self.repository, datetime(2026, 10, 7, 8, 31, tzinfo=BERLIN))
+        self.assertEqual(status["applications"]["unapplied"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

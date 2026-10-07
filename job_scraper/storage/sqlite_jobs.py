@@ -455,6 +455,10 @@ class SQLiteJobRepository:
             fit = {row["fit_status"]: row["total"] for row in connection.execute(
                 "SELECT fit_status, COUNT(*) AS total FROM jobs GROUP BY fit_status"
             )}
+            applications = {row["application_status"]: row["total"] for row in connection.execute(
+                """SELECT application_status, COUNT(*) AS total
+                   FROM jobs GROUP BY application_status"""
+            )}
             unclassified = connection.execute(
                 """SELECT COUNT(*) AS total FROM jobs AS j
                    LEFT JOIN job_classifications AS c
@@ -495,6 +499,7 @@ class SQLiteJobRepository:
             "processing": processing,
             "classifications": classifications,
             "fit": fit,
+            "applications": applications,
             "unclassified": unclassified,
             "scoring_ready": scoring_ready,
             "issues": sorted(issues, key=lambda item: item["occurred_at"] or "", reverse=True)[:5],
