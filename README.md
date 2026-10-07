@@ -99,7 +99,7 @@ The throwaway top-score table has three layout variants and reads scored jobs fr
 uv run --cache-dir .local/uv-cache python job_scraper/prototypes/serve_scored_jobs.py
 ```
 
-Then open `http://127.0.0.1:8765/jobs`. Use the bottom switcher or left/right arrow keys to compare layouts. The table shows at most 50 scored jobs, sorted by score by default with posting date as the tie-breaker.
+Then open `http://127.0.0.1:8765/jobs`. Use the bottom switcher or left/right arrow keys to compare layouts. The table shows at most 50 scored jobs, sorted by score by default with posting date as the tie-breaker. Its Application column shows the saved application status for each job; this column has not yet been deployed to Cloud Run.
 
 The deployed API serves the same read-only prototype. With the authenticated Cloud Run proxy above running on port 8088, open `http://127.0.0.1:8088/jobs`. The page loads scored jobs from `/api/jobs` through the same proxy. Existing API callers can still request JSON from `/jobs` by sending `Accept: application/json`.
 
