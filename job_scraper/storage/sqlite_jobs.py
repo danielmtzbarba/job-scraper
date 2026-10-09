@@ -14,6 +14,7 @@ from typing import Any, Iterator
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import ValidationError
+from job_scraper.application.application_audit import AuditActor, AuditEvent, event, log_event
 
 from job_scraper.models.jobs import (
     AirtableSyncWorkItem,
@@ -192,7 +193,7 @@ class SQLiteJobRepository:
                     deduplication_key TEXT NOT NULL,
                     status TEXT NOT NULL CHECK (status IN
                         ('Selected', 'Inspecting', 'Draft', 'NeedsInput',
-                         'ReadyForReview', 'Submitting', 'SubmissionUnverified')),
+                         'ReadyForReview', 'Submitting', 'SubmissionUnverified', 'Submitted')),
                     profile_id TEXT NOT NULL,
                     profile_version INTEGER NOT NULL,
                     cv_variant TEXT,
@@ -203,12 +204,55 @@ class SQLiteJobRepository:
                     submit_started_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    submitted_at TEXT,
                     UNIQUE (source, deduplication_key),
                     FOREIGN KEY (source, deduplication_key)
                         REFERENCES jobs (source, deduplication_key)
                 );
+                CREATE TABLE IF NOT EXISTS application_audit_events (
+                    id TEXT PRIMARY KEY,
+                    attempt_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    deduplication_key TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    actor_kind TEXT NOT NULL,
+                    request_id TEXT,
+                    from_status TEXT,
+                    to_status TEXT,
+                    reason_code TEXT,
+                    action_kind TEXT,
+                    target_id TEXT,
+                    review_version INTEGER,
+                    model_id TEXT,
+                    prompt_tokens INTEGER,
+                    candidate_tokens INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_application_audit_attempt
+                    ON application_audit_events (attempt_id, occurred_at, id);
                 """
             )
+            # Existing local databases predate the minimal submitted history.
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(application_attempts)")}
+            if "submitted_at" not in columns:
+                connection.execute("ALTER TABLE application_attempts ADD COLUMN submitted_at TEXT")
+            table_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'application_attempts'"
+            ).fetchone()[0]
+            if "'Submitted'" not in table_sql:
+                replacement = table_sql.replace(
+                    "'SubmissionUnverified'", "'SubmissionUnverified', 'Submitted'"
+                ).replace("application_attempts", "application_attempts_new", 1)
+                connection.execute(replacement)
+                names = [row[1] for row in connection.execute("PRAGMA table_info(application_attempts)")]
+                columns_sql = ", ".join(names)
+                connection.execute(
+                    f"INSERT INTO application_attempts_new ({columns_sql}) "
+                    f"SELECT {columns_sql} FROM application_attempts"
+                )
+                connection.execute("DROP TABLE application_attempts")
+                connection.execute("ALTER TABLE application_attempts_new RENAME TO application_attempts")
 
             duplicate_pk = [
                 row[1] for row in connection.execute("PRAGMA table_info(possible_duplicates)")
@@ -1118,7 +1162,55 @@ class SQLiteJobRepository:
             ).fetchone()
             return dict(row) if row else None
 
-    def create_application_attempt(self, attempt: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _insert_application_audit_event(
+        connection: Any, audit_event: AuditEvent, source: str, deduplication_key: str,
+    ) -> str:
+        event_id = uuid4().hex
+        connection.execute(
+            """INSERT INTO application_audit_events
+               (id, attempt_id, source, deduplication_key, occurred_at, event_type,
+                outcome, actor_kind, request_id, from_status, to_status, reason_code,
+                action_kind, target_id, review_version, model_id, prompt_tokens, candidate_tokens)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (event_id, audit_event.attempt_id, source, deduplication_key, _utc_now(),
+             audit_event.event_type, audit_event.outcome, audit_event.actor_kind,
+             audit_event.request_id, audit_event.from_status, audit_event.to_status,
+             audit_event.reason_code, audit_event.action_kind, audit_event.target_id,
+             audit_event.review_version, audit_event.model_id, audit_event.prompt_tokens,
+             audit_event.candidate_tokens),
+        )
+        return event_id
+
+    def append_application_audit_event(self, audit_event: AuditEvent) -> str:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT source, deduplication_key FROM application_attempts WHERE id = ?",
+                (audit_event.attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Application attempt is no longer active.")
+            event_id = self._insert_application_audit_event(
+                connection, audit_event, row["source"], row["deduplication_key"]
+            )
+        log_event(audit_event, event_id)
+        return event_id
+
+    def list_application_audit_events(self, attempt_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT id, attempt_id, occurred_at, event_type, outcome, actor_kind,
+                          request_id, from_status, to_status, reason_code, action_kind,
+                          target_id, review_version, model_id, prompt_tokens, candidate_tokens
+                   FROM application_audit_events WHERE attempt_id = ?
+                   ORDER BY occurred_at, id""", (attempt_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_application_attempt(self, attempt: dict[str, Any],
+                                   *, actor_kind: AuditActor = "internal") -> dict[str, Any]:
+        audit_event = event(attempt["id"], "attempt_started", "succeeded",
+                            default_actor=actor_kind, to_status="Selected")
         with self._connect() as connection:
             connection.execute(
                 """INSERT INTO application_attempts
@@ -1133,7 +1225,11 @@ class SQLiteJobRepository:
             row = connection.execute(
                 "SELECT * FROM application_attempts WHERE id = ?", (attempt["id"],)
             ).fetchone()
-            return dict(row)
+            event_id = self._insert_application_audit_event(
+                connection, audit_event, attempt["source"], attempt["deduplication_key"]
+            )
+        log_event(audit_event, event_id)
+        return dict(row)
 
     def get_application_attempt(self, attempt_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -1148,16 +1244,41 @@ class SQLiteJobRepository:
         with self._connect() as connection:
             row = connection.execute(
                 """SELECT * FROM application_attempts
-                   WHERE source = ? AND deduplication_key = ?""",
+                   WHERE source = ? AND deduplication_key = ? AND status != 'Submitted'""",
                 (source, deduplication_key),
             ).fetchone()
             return dict(row) if row else None
+
+    def list_application_attempts(self) -> list[dict[str, Any]]:
+        """List live, submitted, and discarded process history without answers."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT a.*, j.source_job_id, j.title, j.company, j.overall_fit,
+                          j.application_status, j.application_url
+                   FROM application_attempts AS a JOIN jobs AS j
+                     ON a.source = j.source AND a.deduplication_key = j.deduplication_key
+                   ORDER BY a.updated_at DESC"""
+            ).fetchall()
+            discarded = connection.execute(
+                """SELECT e.attempt_id AS id, 'Discarded' AS status,
+                          e.occurred_at AS updated_at, e.source, e.deduplication_key,
+                          j.source_job_id, j.title, j.company, j.overall_fit,
+                          j.application_status, j.application_url
+                   FROM application_audit_events AS e
+                   LEFT JOIN jobs AS j ON e.source = j.source
+                       AND e.deduplication_key = j.deduplication_key
+                   WHERE e.event_type = 'attempt_discarded'
+                   ORDER BY e.occurred_at DESC"""
+            ).fetchall()
+        return sorted((dict(row) for row in [*rows, *discarded]),
+                      key=lambda row: row["updated_at"], reverse=True)
 
     def transition_application_attempt(
         self, attempt_id: str, expected_status: str, new_status: str,
         *, review_digest: str | None = None, approved_at: str | None = None,
         submit_started_at: str | None = None, cv_variant: str | None = None,
         increment_review: bool = False, expected_review_digest: str | None = None,
+        actor_kind: AuditActor = "internal",
     ) -> dict[str, Any]:
         """Atomically claim one state transition across MCP and browser clients."""
         now = _utc_now()
@@ -1184,14 +1305,65 @@ class SQLiteJobRepository:
             row = connection.execute(
                 "SELECT * FROM application_attempts WHERE id = ?", (attempt_id,)
             ).fetchone()
-            return dict(row)
+            kind = ("review_prepared" if new_status == "ReadyForReview" else
+                    "submission_claimed" if new_status == "Submitting" else
+                    "submission_result" if new_status == "SubmissionUnverified" else "state_changed")
+            audit_event = event(
+                attempt_id, kind,
+                "uncertain" if new_status == "SubmissionUnverified" else "succeeded",
+                default_actor=actor_kind, from_status=expected_status, to_status=new_status,
+                review_version=row["review_version"],
+            )
+            event_id = self._insert_application_audit_event(
+                connection, audit_event, row["source"], row["deduplication_key"]
+            )
+        log_event(audit_event, event_id)
+        return dict(row)
 
-    def delete_application_attempt(self, attempt_id: str) -> None:
+    def approve_application_review(self, attempt_id: str, review_digest: str,
+                                   *, actor_kind: AuditActor = "internal") -> dict[str, Any]:
+        """Bind an explicit UI review approval to the current persisted digest."""
         with self._connect() as connection:
-            connection.execute("DELETE FROM application_attempts WHERE id = ?", (attempt_id,))
+            cursor = connection.execute(
+                """UPDATE application_attempts SET approved_at = ?, updated_at = ?
+                   WHERE id = ? AND status = 'ReadyForReview' AND review_digest = ?""",
+                (_utc_now(), _utc_now(), attempt_id, review_digest),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Review changed; reload it before approving.")
+            row = connection.execute(
+                "SELECT * FROM application_attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            audit_event = event(attempt_id, "review_approved", "succeeded",
+                                default_actor=actor_kind, from_status="ReadyForReview",
+                                to_status="ReadyForReview", review_version=row["review_version"])
+            event_id = self._insert_application_audit_event(
+                connection, audit_event, row["source"], row["deduplication_key"]
+            )
+        log_event(audit_event, event_id)
+        return dict(row)
 
-    def complete_application_attempt(self, attempt_id: str) -> None:
-        """Record the outcome and erase temporary attempt metadata together."""
+    def delete_application_attempt(self, attempt_id: str,
+                                   *, actor_kind: AuditActor = "internal") -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT source, deduplication_key, status FROM application_attempts WHERE id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Application attempt was not found.")
+            audit_event = event(attempt_id, "attempt_discarded", "succeeded",
+                                default_actor=actor_kind, from_status=row["status"],
+                                to_status="Discarded")
+            event_id = self._insert_application_audit_event(
+                connection, audit_event, row["source"], row["deduplication_key"]
+            )
+            connection.execute("DELETE FROM application_attempts WHERE id = ?", (attempt_id,))
+        log_event(audit_event, event_id)
+
+    def complete_application_attempt(self, attempt_id: str,
+                                     *, actor_kind: AuditActor = "internal") -> None:
+        """Record only durable submission identity and time with the job outcome."""
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -1206,7 +1378,20 @@ class SQLiteJobRepository:
             )
             if cursor.rowcount != 1:
                 raise ValueError("Job outcome changed; application attempt was retained.")
-            connection.execute("DELETE FROM application_attempts WHERE id = ?", (attempt_id,))
+            connection.execute(
+                """UPDATE application_attempts SET status = 'Submitted',
+                   artifact_ref = '', review_digest = NULL, approved_at = NULL,
+                   submit_started_at = NULL, submitted_at = ?, updated_at = ?
+                   WHERE id = ?""",
+                (_utc_now(), _utc_now(), attempt_id),
+            )
+            audit_event = event(attempt_id, "submission_confirmed", "succeeded",
+                                default_actor=actor_kind, from_status=row["status"],
+                                to_status="Submitted")
+            event_id = self._insert_application_audit_event(
+                connection, audit_event, row["source"], row["deduplication_key"]
+            )
+        log_event(audit_event, event_id)
 
     def requeue_classification(self, source: str, deduplication_key: str) -> None:
         """Refresh a selection when its reviewed profile version has changed."""

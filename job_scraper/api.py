@@ -35,6 +35,8 @@ from job_scraper.application.classification_worker import ClassificationWorker, 
 from job_scraper.application.scoring_worker import ScoringWorker, scoring_loop
 from job_scraper.application.jobs import JobService
 from job_scraper.application.application_workflow import ApplicationWorkflow, ApplicationWorkflowError
+from job_scraper.application.application_audit import audit_scope
+from job_scraper.application.browser_agent import BrowserAction
 from job_scraper.application.model_evaluation import ScoringSettings
 from job_scraper.application.profiles import ProfileStore
 from job_scraper.application.search_schedule import (
@@ -167,7 +169,8 @@ async def lifespan(app: FastAPI):
         raise
     app.state.jobs = repository
     app.state.profiles = ProfileStore(_profile_dir())
-    app.state.applications = ApplicationWorkflow(repository, PROJECT_ROOT, app.state.profiles)
+    app.state.applications = ApplicationWorkflow(
+        repository, PROJECT_ROOT, app.state.profiles, default_actor_kind="web")
     pause_background_workers = os.getenv("JOB_SCRAPER_PAUSE_BACKGROUND_WORKERS") == "1"
     classification_settings = None if pause_background_workers else _classification_settings()
     scoring_settings = None if pause_background_workers else _scoring_settings()
@@ -255,9 +258,10 @@ app = FastAPI(
 
 @app.middleware("http")
 async def private_application_cache(request: Request, call_next):
-    response = await call_next(request)
     path = request.url.path
-    if path.startswith("/applications/") or path.startswith("/api/applications/") or path.endswith("/application-attempt"):
+    with audit_scope("mcp" if path.startswith("/mcp") else "web"):
+        response = await call_next(request)
+    if path.startswith("/applications") or path.startswith("/api/applications") or path.endswith("/application-attempt"):
         response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -293,6 +297,22 @@ def _application_result(operation):
 
 class ApplicationAnswersRequest(BaseModel):
     answers: dict[str, str]
+
+
+class ApplicationActionRequest(BaseModel):
+    source_job_ids: list[str]
+
+
+class ApplicationConsentRequest(BaseModel):
+    observation_id: str
+    target_id: str
+    explicit_user_approval: bool
+
+
+class ApplicationAgentAnswerRequest(BaseModel):
+    observation_id: str
+    target_id: str
+    value: str
     explicitly_approved_consent_fields: list[str] = []
 
 
@@ -563,6 +583,29 @@ def application_page(attempt_id: str, request: Request) -> FileResponse:
     return FileResponse(PROJECT_ROOT / "job_scraper" / "prototypes" / "application_review.html")
 
 
+@app.get("/applications", include_in_schema=False)
+def applications_page() -> FileResponse:
+    return FileResponse(PROJECT_ROOT / "job_scraper" / "prototypes" / "applications.html")
+
+
+@app.get("/api/applications")
+def list_applications(request: Request) -> dict[str, Any]:
+    return {"applications": _applications(request).list_applications()}
+
+
+@app.get("/api/jobs/{source_job_id}/application-action")
+def job_application_action(source_job_id: str, request: Request) -> dict[str, Any]:
+    return _application_result(lambda: _applications(request).job_action(source_job_id))
+
+
+@app.post("/api/jobs/application-actions")
+def job_application_actions(body: ApplicationActionRequest, request: Request) -> dict[str, Any]:
+    if len(body.source_job_ids) > 500:
+        raise HTTPException(status_code=422, detail="At most 500 job IDs can be checked.")
+    return {source_job_id: _applications(request).job_action(source_job_id)
+            for source_job_id in dict.fromkeys(body.source_job_ids)}
+
+
 @app.post("/api/jobs/{source_job_id}/application-attempt")
 def start_application_attempt(source_job_id: str, request: Request) -> dict[str, Any]:
     return _application_result(lambda: _applications(request).start_attempt(source_job_id))
@@ -571,6 +614,12 @@ def start_application_attempt(source_job_id: str, request: Request) -> dict[str,
 @app.get("/api/applications/{attempt_id}")
 def get_application_attempt(attempt_id: str, request: Request) -> dict[str, Any]:
     return _application_result(lambda: _applications(request).get_attempt(attempt_id))
+
+
+@app.get("/api/applications/{attempt_id}/audit")
+def get_application_audit(attempt_id: str, request: Request) -> dict[str, Any]:
+    return {"attempt_id": attempt_id,
+            "events": _applications(request).audit_events(attempt_id)}
 
 
 @app.get("/api/applications/{attempt_id}/capture")
@@ -582,6 +631,35 @@ def get_application_capture(attempt_id: str, request: Request) -> FileResponse:
 @app.post("/api/applications/{attempt_id}/inspect")
 def inspect_application(attempt_id: str, request: Request) -> dict[str, Any]:
     return _application_result(lambda: _applications(request).inspect_form(attempt_id))
+
+
+@app.post("/api/applications/{attempt_id}/observe")
+def observe_application(attempt_id: str, request: Request) -> dict[str, Any]:
+    return _application_result(lambda: _applications(request).observe_page(attempt_id))
+
+
+@app.post("/api/applications/{attempt_id}/act")
+def act_on_application(attempt_id: str, body: BrowserAction, request: Request) -> dict[str, Any]:
+    return _application_result(lambda: _applications(request).act_on_page(attempt_id, body))
+
+
+@app.post("/api/applications/{attempt_id}/guide")
+def guide_application(attempt_id: str, request: Request) -> dict[str, Any]:
+    return _application_result(lambda: _applications(request).agent_step(attempt_id))
+
+
+@app.post("/api/applications/{attempt_id}/approve-consent")
+def approve_application_consent(attempt_id: str, body: ApplicationConsentRequest, request: Request) -> dict[str, Any]:
+    return _application_result(lambda: _applications(request).approve_agent_consent(
+        attempt_id, body.observation_id, body.target_id, body.explicit_user_approval
+    ))
+
+
+@app.post("/api/applications/{attempt_id}/agent-answer")
+def save_agent_answer(attempt_id: str, body: ApplicationAgentAnswerRequest, request: Request) -> dict[str, Any]:
+    return _application_result(lambda: _applications(request).save_agent_answer(
+        attempt_id, body.observation_id, body.target_id, body.value
+    ))
 
 
 @app.post("/api/applications/{attempt_id}/answers")
@@ -603,6 +681,15 @@ def submit_application(
     attempt_id: str, body: ApplicationSubmitRequest, request: Request
 ) -> dict[str, Any]:
     return _application_result(lambda: _applications(request).submit(
+        attempt_id, body.review_digest, body.explicit_user_approval
+    ))
+
+
+@app.post("/api/applications/{attempt_id}/approve-review")
+def approve_application_review(
+    attempt_id: str, body: ApplicationSubmitRequest, request: Request
+) -> dict[str, Any]:
+    return _application_result(lambda: _applications(request).approve_review(
         attempt_id, body.review_digest, body.explicit_user_approval
     ))
 

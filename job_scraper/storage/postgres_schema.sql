@@ -130,7 +130,7 @@ CREATE TABLE IF NOT EXISTS application_attempts (
     deduplication_key TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN
         ('Selected', 'Inspecting', 'Draft', 'NeedsInput',
-         'ReadyForReview', 'Submitting', 'SubmissionUnverified')),
+         'ReadyForReview', 'Submitting', 'SubmissionUnverified', 'Submitted')),
     profile_id TEXT NOT NULL,
     profile_version INTEGER NOT NULL,
     cv_variant TEXT,
@@ -141,10 +141,33 @@ CREATE TABLE IF NOT EXISTS application_attempts (
     submit_started_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    submitted_at TEXT,
     UNIQUE (source, deduplication_key),
     FOREIGN KEY (source, deduplication_key)
         REFERENCES jobs (source, deduplication_key)
 );
+CREATE TABLE IF NOT EXISTS application_audit_events (
+    id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    deduplication_key TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    actor_kind TEXT NOT NULL,
+    request_id TEXT,
+    from_status TEXT,
+    to_status TEXT,
+    reason_code TEXT,
+    action_kind TEXT,
+    target_id TEXT,
+    review_version INTEGER,
+    model_id TEXT,
+    prompt_tokens INTEGER,
+    candidate_tokens INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_application_audit_attempt
+    ON application_audit_events (attempt_id, occurred_at, id);
 
 CREATE INDEX IF NOT EXISTS idx_job_processing_queue
     ON job_processing (source, processing_status, fetch_next_retry_at);

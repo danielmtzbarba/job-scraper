@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from job_scraper.application.jobs import JobService
 from job_scraper.application.application_workflow import ApplicationWorkflow, ApplicationWorkflowError
+from job_scraper.application.browser_agent import BrowserAction
 from job_scraper.application.profiles import ProfileStore
 from job_scraper.application.scoring_prompt import (
     PROMPT_VERSION,
@@ -81,7 +82,8 @@ async def _server_lifespan(_server: MCPServer) -> AsyncIterator[ServerContext]:
         yield ServerContext(
             jobs=JobService(repository),
             profiles=profiles,
-            applications=ApplicationWorkflow(repository, project_root, profiles),
+            applications=ApplicationWorkflow(
+                repository, project_root, profiles, default_actor_kind="mcp"),
         )
     finally:
         if hasattr(repository, "close"):
@@ -276,6 +278,58 @@ def create_server(
             result = _applications(ctx).inspect_form(attempt_id)
             return [json.dumps(result, ensure_ascii=False), Image(path=result["screenshot_path"])]
         except (ApplicationWorkflowError, LookupError) as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool()
+    def observe_application_page(ctx: Context[ServerContext], attempt_id: str) -> list[str | Image]:
+        """Observe current page and handle cookie chrome by the approved policy."""
+        try:
+            result = _applications(ctx).observe_page(attempt_id)
+            return [json.dumps(result, ensure_ascii=False), Image(path=result["screenshot_path"])]
+        except (ApplicationWorkflowError, LookupError) as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool()
+    def act_on_application_page(
+        ctx: Context[ServerContext], attempt_id: str, action: BrowserAction
+    ) -> list[str | Image]:
+        """Execute one typed action against the current observation, then observe again."""
+        try:
+            result = _applications(ctx).act_on_page(attempt_id, action)
+            return [json.dumps(result, ensure_ascii=False), Image(path=result["screenshot_path"])]
+        except (ApplicationWorkflowError, LookupError) as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool()
+    def guide_application_step(ctx: Context[ServerContext], attempt_id: str) -> dict[str, object]:
+        """Use Vertex Gemini for one bounded observe/decide/act cycle."""
+        try:
+            return _applications(ctx).agent_step(attempt_id)
+        except (ApplicationWorkflowError, LookupError) as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool()
+    def approve_application_consent(
+        ctx: Context[ServerContext], attempt_id: str, observation_id: str,
+        target_id: str, explicit_user_approval: bool
+    ) -> dict[str, object]:
+        """Record this employer-specific choice only after the user approves it."""
+        try:
+            return _applications(ctx).approve_agent_consent(
+                attempt_id, observation_id, target_id, explicit_user_approval
+            )
+        except ApplicationWorkflowError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool()
+    def save_guided_application_answer(
+        ctx: Context[ServerContext], attempt_id: str, observation_id: str,
+        target_id: str, value: str
+    ) -> dict[str, object]:
+        """Save a user-provided answer for a control in the current observation."""
+        try:
+            return _applications(ctx).save_agent_answer(attempt_id, observation_id, target_id, value)
+        except ApplicationWorkflowError as exc:
             raise ToolError(str(exc)) from exc
 
     @server.tool()

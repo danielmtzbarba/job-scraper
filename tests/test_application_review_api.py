@@ -46,6 +46,11 @@ class ApplicationReviewApiTest(unittest.TestCase):
                     first = await client.post("/api/jobs/job-1/application-attempt")
                     self.assertEqual(first.status_code, 200, first.text)
                     attempt_id = first.json()["attempt_id"]
+                    action = await client.get("/api/jobs/job-1/application-action")
+                    self.assertEqual(action.json()["label"], "Continue application")
+                    listing = await client.get("/api/applications")
+                    self.assertEqual(listing.json()["applications"][0]["id"], attempt_id)
+                    self.assertEqual((await client.get("/applications")).status_code, 200)
                     second = await client.post("/api/jobs/job-1/application-attempt")
                     self.assertEqual(second.json()["attempt_id"], attempt_id)
                     review = await client.get(f"/applications/{attempt_id}")
@@ -60,7 +65,16 @@ class ApplicationReviewApiTest(unittest.TestCase):
                     )
                     self.assertEqual(discarded.status_code, 200, discarded.text)
                     self.assertEqual(repository.get_job("job-1")["application_status"], "Saved")
-                    self.assertEqual((await client.get(f"/api/applications/{attempt_id}")).status_code, 409)
+                    history = (await client.get("/api/applications")).json()["applications"]
+                    self.assertEqual(history[0]["status"], "Discarded")
+                    self.assertEqual((await client.get(f"/api/applications/{attempt_id}")).json()["status"], "Discarded")
+                    audit = await client.get(f"/api/applications/{attempt_id}/audit")
+                    self.assertEqual(audit.headers["cache-control"], "no-store")
+                    events = audit.json()["events"]
+                    self.assertEqual([item["event_type"] for item in events],
+                                     ["attempt_started", "artifact_erased", "attempt_discarded"])
+                    self.assertEqual({item["actor_kind"] for item in events}, {"web"})
+                    self.assertTrue(all(item["request_id"] for item in events))
 
             asyncio.run(exercise())
 
