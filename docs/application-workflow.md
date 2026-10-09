@@ -1,6 +1,6 @@
 # Job application workflow
 
-Status: local MCP workflow and `/applications/{attempt_id}` review page implemented. The PostgreSQL attempt-table migration was applied to Cloud SQL on 2026-10-09. No real application has been submitted with this workflow.
+Status: MCP workflow and `/applications/{attempt_id}` review routes deployed to Cloud Run on 2026-10-09. The PostgreSQL attempt-table migration is applied. Cloud Run attempt creation remains disabled until private artifact storage is persistent. No real application has been submitted with this workflow.
 
 ## Goal
 
@@ -40,7 +40,7 @@ The map should point to the existing classified profile/CV variant; it must not 
 
 ## Shared module boundary (MCP and ADK)
 
-The shared Python implementation is `job_scraper.application.application_workflow.ApplicationWorkflow`; MCP tools adapt its readiness, attempt, inspect, answer, review, submit, and discard operations. MCP tools and a future ADK adapter should call the same module so classification checks, consent gates, retention, and submit confirmation cannot diverge by client. Playwright is the initial browser driver. The current implementation inspects only the visible page and does not advance multi-step forms. This code is local only and has not been deployed or run against a real application.
+The shared Python implementation is `job_scraper.application.application_workflow.ApplicationWorkflow`; MCP tools adapt its readiness, attempt, inspect, answer, review, submit, and discard operations. MCP tools and a future ADK adapter should call the same module so classification checks, consent gates, retention, and submit confirmation cannot diverge by client. Playwright is the initial browser driver. The current implementation inspects only the visible page and does not advance multi-step forms. The code is deployed, but Cloud Run attempt creation is disabled and it has not been run against a real application.
 
 The implementation records active process state, profile and CV variant, review version and digest, and approval timestamps in `application_attempts`. SQLite creates this table locally; [the migration](../deploy/migrations/2026-10-09-application-attempts.sql) was applied to Cloud SQL on 2026-10-09. The table enforces one active attempt per job. The review page and MCP tools call the same module. Final approval atomically claims the persisted review digest before the browser click. A possible click without verified confirmation leaves `SubmissionUnverified`, which cannot be retried or edited. Confirming submission sets the job outcome to `Applied` and deletes the attempt row; discard deletes the row without changing the job outcome. Both closure paths erase the private artifacts.
 
@@ -48,7 +48,7 @@ The general MCP `update_application_status` tool refuses `Applied`; that transit
 
 MCP tools currently include `check_application_readiness`, `start_application_attempt`, `inspect_application_form`, `get_application_facts`, `add_approved_application_fact`, `save_application_answers`, `prepare_application_review`, `submit_application`, `confirm_application_submitted`, and `discard_application_attempt`. The caller must use only approved facts and ask the user about unclear fields and employer-specific consent. `add_approved_application_fact` appends a new key and will not overwrite an existing fact. Selecting a talent pool or group-sharing option requires a separate approved selector in the pilot.
 
-Known implementation limits: form inspection does not advance to later steps; automated filling currently supports inspected CSS-addressable controls and the first file input; no live form has been exercised in this implementation pass. Cloud Run attempts fail closed because `.local` artifacts would be lost on instance replacement. Before remote use, select persistent private artifact storage and deploy the application workflow code. The current browser route is local only. Verify end-to-end browser behavior on a safe test form before a real pilot.
+Known implementation limits: form inspection does not advance to later steps; automated filling currently supports inspected CSS-addressable controls and the first file input; no live form has been exercised in this implementation pass. Cloud Run attempts fail closed because `.local` artifacts would be lost on instance replacement. Before remote use, select persistent private artifact storage and map the prepared PDFs. The browser route is deployed, but an attempt cannot start there yet. Verify end-to-end browser behavior on a safe test form before a real pilot.
 
 ## Questions for later design
 

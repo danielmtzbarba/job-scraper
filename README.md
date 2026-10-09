@@ -17,6 +17,8 @@ gcloud run services proxy job-scraper \
 
 The first revision was deployed from this repository with `gcloud run deploy --source .`, using the Dockerfile, the tracked environment file, runtime service account `job-scraper-run@jobsearch-danielmtz-2026.iam.gserviceaccount.com`, an IAM-only ingress policy, 1 vCPU, 2 GiB memory, min/max one instance, unthrottled CPU, and a read-only Cloud Storage volume mounted at `/app/.local/profiles` with `only-dir=releases/d91feaf2493767d2`. Preserve these settings on subsequent revisions. The in-process scheduler still needs restart-safe catch-up and DST review, and remote MCP client authentication has not been configured.
 
+Revision `job-scraper-00003-ffd` (2026-10-09) serves the application-links filter and review routes. Cloud Run attempt creation deliberately returns a workflow error until private attempt artifacts have persistent storage; the local API can use Cloud SQL attempts now. No employer application has been submitted through the deployed workflow.
+
 ## Local prerequisites
 
 - Python 3.12
@@ -93,7 +95,7 @@ That local `curl` command uploads a file to your local API; it does not request 
 
 ### Scored jobs and application review
 
-The current local FastAPI `/jobs` page has an **Application links** filter. It shows **Start or continue** in the Application column for saved scored jobs that have an application URL. That action opens `/applications/{attempt_id}`. A current saved classification is required when starting an attempt, and a mapped PDF is required before preparing the filled review. The local SQLite snapshot may contain application links without classifications; in that case the action explains why it cannot proceed. The Cloud Run page still serves an older read-only build.
+The current FastAPI `/jobs` page has an **Application links** filter. It shows **Start or continue** in the Application column for saved scored jobs that have an application URL. That action opens `/applications/{attempt_id}` when attempt storage is available. A current saved classification is required when starting an attempt, and a mapped PDF is required before preparing the filled review. The local SQLite snapshot may contain application links without classifications; in that case the action explains why it cannot proceed. Cloud Run serves this page but refuses attempt creation until persistent private artifact storage is configured.
 
 For a local review session without scheduled collection or background classification/scoring, start the API with:
 
@@ -112,9 +114,9 @@ The throwaway top-score table has three layout variants and reads scored jobs fr
 uv run --cache-dir .local/uv-cache python job_scraper/prototypes/serve_scored_jobs.py
 ```
 
-Then open `http://127.0.0.1:8765/jobs`. Use the bottom switcher or left/right arrow keys to compare layouts. The table shows at most 50 scored jobs, sorted by score by default with posting date as the tie-breaker. Its Application column shows the saved application status for each job; this column has not yet been deployed to Cloud Run.
+Then open `http://127.0.0.1:8765/jobs`. Use the bottom switcher or left/right arrow keys to compare layouts. The table shows at most 50 scored jobs, sorted by score by default with posting date as the tie-breaker. This prototype server is read-only and cannot start attempts; use the FastAPI server for application actions.
 
-The deployed API serves the same read-only prototype. With the authenticated Cloud Run proxy above running on port 8088, open `http://127.0.0.1:8088/jobs`. The page loads scored jobs from `/api/jobs` through the same proxy. Existing API callers can still request JSON from `/jobs` by sending `Accept: application/json`.
+The deployed API serves the scored-jobs page. With the authenticated Cloud Run proxy above running on port 8088, open `http://127.0.0.1:8088/jobs`. The page loads scored jobs from `/api/jobs` through the same proxy. It displays application actions, but Cloud Run attempt creation remains disabled until persistent private artifact storage is configured. Existing API callers can still request JSON from `/jobs` by sending `Accept: application/json`.
 
 After importing a results page, the background worker queues its jobs for detail enrichment. You can also enrich one staged job with a manually saved detail page:
 
