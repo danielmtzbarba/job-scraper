@@ -186,6 +186,27 @@ class SQLiteJobRepository:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (source, deduplication_key)
                 );
+                CREATE TABLE IF NOT EXISTS application_attempts (
+                    id TEXT PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    deduplication_key TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN
+                        ('Selected', 'Inspecting', 'Draft', 'NeedsInput',
+                         'ReadyForReview', 'Submitting', 'SubmissionUnverified')),
+                    profile_id TEXT NOT NULL,
+                    profile_version INTEGER NOT NULL,
+                    cv_variant TEXT,
+                    artifact_ref TEXT NOT NULL,
+                    review_version INTEGER NOT NULL DEFAULT 0,
+                    review_digest TEXT,
+                    approved_at TEXT,
+                    submit_started_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (source, deduplication_key),
+                    FOREIGN KEY (source, deduplication_key)
+                        REFERENCES jobs (source, deduplication_key)
+                );
                 """
             )
 
@@ -1096,6 +1117,96 @@ class SQLiteJobRepository:
                 (source, deduplication_key),
             ).fetchone()
             return dict(row) if row else None
+
+    def create_application_attempt(self, attempt: dict[str, Any]) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO application_attempts
+                   (id, source, deduplication_key, status, profile_id,
+                    profile_version, cv_variant, artifact_ref, created_at, updated_at)
+                   VALUES (?, ?, ?, 'Selected', ?, ?, ?, ?, ?, ?)""",
+                (attempt["id"], attempt["source"], attempt["deduplication_key"],
+                 attempt["profile_id"], attempt["profile_version"],
+                 attempt.get("cv_variant"), attempt["artifact_ref"],
+                 attempt["created_at"], attempt["created_at"]),
+            )
+            row = connection.execute(
+                "SELECT * FROM application_attempts WHERE id = ?", (attempt["id"],)
+            ).fetchone()
+            return dict(row)
+
+    def get_application_attempt(self, attempt_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM application_attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_application_attempt_for_job(
+        self, source: str, deduplication_key: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT * FROM application_attempts
+                   WHERE source = ? AND deduplication_key = ?""",
+                (source, deduplication_key),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def transition_application_attempt(
+        self, attempt_id: str, expected_status: str, new_status: str,
+        *, review_digest: str | None = None, approved_at: str | None = None,
+        submit_started_at: str | None = None, cv_variant: str | None = None,
+        increment_review: bool = False, expected_review_digest: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically claim one state transition across MCP and browser clients."""
+        now = _utc_now()
+        review_guard = " AND review_digest = ?" if expected_review_digest is not None else ""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE application_attempts SET status = ?, updated_at = ?,
+                     review_digest = CASE WHEN ? IN ('Draft', 'Inspecting', 'NeedsInput')
+                         THEN NULL ELSE COALESCE(?, review_digest) END,
+                     approved_at = CASE WHEN ? IN ('Draft', 'Inspecting', 'NeedsInput', 'ReadyForReview')
+                         THEN NULL ELSE COALESCE(?, approved_at) END,
+                     submit_started_at = CASE WHEN ? IN ('Draft', 'Inspecting', 'NeedsInput', 'ReadyForReview')
+                         THEN NULL ELSE COALESCE(?, submit_started_at) END,
+                     cv_variant = COALESCE(?, cv_variant),
+                     review_version = review_version + ?
+                   WHERE id = ? AND status = ?""" + review_guard,
+                (new_status, now, new_status, review_digest, new_status, approved_at,
+                 new_status, submit_started_at, cv_variant, 1 if increment_review else 0,
+                 attempt_id, expected_status)
+                + ((expected_review_digest,) if expected_review_digest is not None else ()),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Application attempt changed; reload it before continuing.")
+            row = connection.execute(
+                "SELECT * FROM application_attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            return dict(row)
+
+    def delete_application_attempt(self, attempt_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM application_attempts WHERE id = ?", (attempt_id,))
+
+    def complete_application_attempt(self, attempt_id: str) -> None:
+        """Record the outcome and erase temporary attempt metadata together."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM application_attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if row is None or row["status"] not in ("Submitting", "SubmissionUnverified"):
+                raise ValueError("Application attempt is not awaiting submission confirmation.")
+            cursor = connection.execute(
+                """UPDATE jobs SET application_status = 'Applied'
+                   WHERE source = ? AND deduplication_key = ? AND application_status = 'Saved'""",
+                (row["source"], row["deduplication_key"]),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Job outcome changed; application attempt was retained.")
+            connection.execute("DELETE FROM application_attempts WHERE id = ?", (attempt_id,))
 
     def requeue_classification(self, source: str, deduplication_key: str) -> None:
         """Refresh a selection when its reviewed profile version has changed."""

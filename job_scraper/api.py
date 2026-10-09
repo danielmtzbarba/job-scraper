@@ -34,6 +34,7 @@ from job_scraper.models.jobs import (
 from job_scraper.application.classification_worker import ClassificationWorker, classification_loop
 from job_scraper.application.scoring_worker import ScoringWorker, scoring_loop
 from job_scraper.application.jobs import JobService
+from job_scraper.application.application_workflow import ApplicationWorkflow, ApplicationWorkflowError
 from job_scraper.application.model_evaluation import ScoringSettings
 from job_scraper.application.profiles import ProfileStore
 from job_scraper.application.search_schedule import (
@@ -166,13 +167,15 @@ async def lifespan(app: FastAPI):
         raise
     app.state.jobs = repository
     app.state.profiles = ProfileStore(_profile_dir())
-    classification_settings = _classification_settings()
-    scoring_settings = _scoring_settings()
+    app.state.applications = ApplicationWorkflow(repository, PROJECT_ROOT, app.state.profiles)
+    pause_background_workers = os.getenv("JOB_SCRAPER_PAUSE_BACKGROUND_WORKERS") == "1"
+    classification_settings = None if pause_background_workers else _classification_settings()
+    scoring_settings = None if pause_background_workers else _scoring_settings()
     app.state.search_tasks = set()
-    scheduler_task = asyncio.create_task(
+    scheduler_task = None if pause_background_workers else asyncio.create_task(
         search_scheduler(repository, fetch_all_search_results, app.state.search_tasks)
     )
-    worker_task = asyncio.create_task(
+    worker_task = None if pause_background_workers else asyncio.create_task(
         detail_fetcher_cron(repository, interval_seconds=_detail_fetch_interval())
     )
     classification_task = None
@@ -209,22 +212,26 @@ async def lifespan(app: FastAPI):
         async with mcp_server.session_manager.run():
             yield
     finally:
-        scheduler_task.cancel()
+        if scheduler_task:
+            scheduler_task.cancel()
         for task in app.state.search_tasks:
             task.cancel()
-        worker_task.cancel()
+        if worker_task:
+            worker_task.cancel()
         classification_stop.set()
         scoring_stop.set()
-        try:
-            await scheduler_task
-        except asyncio.CancelledError:
-            pass
+        if scheduler_task:
+            try:
+                await scheduler_task
+            except asyncio.CancelledError:
+                pass
         if app.state.search_tasks:
             await asyncio.gather(*app.state.search_tasks, return_exceptions=True)
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
+        if worker_task:
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
         if classification_task:
             await classification_task
         if scoring_task:
@@ -246,10 +253,20 @@ app = FastAPI(
 )
 
 
+@app.middleware("http")
+async def private_application_cache(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/applications/") or path.startswith("/api/applications/") or path.endswith("/application-attempt"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 def _mcp_context() -> ServerContext:
     return ServerContext(
         jobs=JobService(app.state.jobs),
         profiles=app.state.profiles,
+        applications=app.state.applications,
     )
 
 
@@ -259,6 +276,33 @@ mcp_http_app = mcp_server.streamable_http_app(json_response=True)
 
 def _repository(request: Request) -> SQLiteJobRepository:
     return request.app.state.jobs
+
+
+def _applications(request: Request) -> ApplicationWorkflow:
+    return request.app.state.applications
+
+
+def _application_result(operation):
+    try:
+        return operation()
+    except ApplicationWorkflowError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+class ApplicationAnswersRequest(BaseModel):
+    answers: dict[str, str]
+    explicitly_approved_consent_fields: list[str] = []
+
+
+class ApplicationSubmitRequest(BaseModel):
+    review_digest: str
+    explicit_user_approval: bool
+
+
+class ApplicationDecisionRequest(BaseModel):
+    explicit_user_confirmation: bool
 
 
 async def _read_html(file: UploadFile) -> str:
@@ -511,6 +555,74 @@ async def fetch_and_import_job_detail(
 @app.get("/status", include_in_schema=False)
 def status_page() -> FileResponse:
     return FileResponse(PROJECT_ROOT / "job_scraper" / "prototypes" / "status.html")
+
+
+@app.get("/applications/{attempt_id}", include_in_schema=False)
+def application_page(attempt_id: str, request: Request) -> FileResponse:
+    _application_result(lambda: _applications(request).get_attempt(attempt_id))
+    return FileResponse(PROJECT_ROOT / "job_scraper" / "prototypes" / "application_review.html")
+
+
+@app.post("/api/jobs/{source_job_id}/application-attempt")
+def start_application_attempt(source_job_id: str, request: Request) -> dict[str, Any]:
+    return _application_result(lambda: _applications(request).start_attempt(source_job_id))
+
+
+@app.get("/api/applications/{attempt_id}")
+def get_application_attempt(attempt_id: str, request: Request) -> dict[str, Any]:
+    return _application_result(lambda: _applications(request).get_attempt(attempt_id))
+
+
+@app.get("/api/applications/{attempt_id}/capture")
+def get_application_capture(attempt_id: str, request: Request) -> FileResponse:
+    path = _application_result(lambda: _applications(request).capture_path(attempt_id))
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/applications/{attempt_id}/inspect")
+def inspect_application(attempt_id: str, request: Request) -> dict[str, Any]:
+    return _application_result(lambda: _applications(request).inspect_form(attempt_id))
+
+
+@app.post("/api/applications/{attempt_id}/answers")
+def save_application_answers(
+    attempt_id: str, body: ApplicationAnswersRequest, request: Request
+) -> dict[str, Any]:
+    return _application_result(lambda: _applications(request).save_answers(
+        attempt_id, body.answers, body.explicitly_approved_consent_fields
+    ))
+
+
+@app.post("/api/applications/{attempt_id}/review")
+def prepare_application_review(attempt_id: str, request: Request) -> dict[str, Any]:
+    return _application_result(lambda: _applications(request).fill_for_review(attempt_id))
+
+
+@app.post("/api/applications/{attempt_id}/submit")
+def submit_application(
+    attempt_id: str, body: ApplicationSubmitRequest, request: Request
+) -> dict[str, Any]:
+    return _application_result(lambda: _applications(request).submit(
+        attempt_id, body.review_digest, body.explicit_user_approval
+    ))
+
+
+@app.post("/api/applications/{attempt_id}/confirm-submitted")
+def confirm_application_submitted(
+    attempt_id: str, body: ApplicationDecisionRequest, request: Request
+) -> dict[str, Any]:
+    return _application_result(lambda: _applications(request).confirm_submitted(
+        attempt_id, body.explicit_user_confirmation
+    ))
+
+
+@app.post("/api/applications/{attempt_id}/discard")
+def discard_application_attempt(
+    attempt_id: str, body: ApplicationDecisionRequest, request: Request
+) -> dict[str, Any]:
+    return _application_result(lambda: _applications(request).discard(
+        attempt_id, body.explicit_user_confirmation
+    ))
 
 
 @app.get("/api/status")

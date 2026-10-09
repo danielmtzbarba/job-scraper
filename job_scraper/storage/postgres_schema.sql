@@ -124,6 +124,27 @@ CREATE TABLE IF NOT EXISTS job_classifications (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (source, deduplication_key)
 );
+CREATE TABLE IF NOT EXISTS application_attempts (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    deduplication_key TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN
+        ('Selected', 'Inspecting', 'Draft', 'NeedsInput',
+         'ReadyForReview', 'Submitting', 'SubmissionUnverified')),
+    profile_id TEXT NOT NULL,
+    profile_version INTEGER NOT NULL,
+    cv_variant TEXT,
+    artifact_ref TEXT NOT NULL,
+    review_version INTEGER NOT NULL DEFAULT 0,
+    review_digest TEXT,
+    approved_at TEXT,
+    submit_started_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (source, deduplication_key),
+    FOREIGN KEY (source, deduplication_key)
+        REFERENCES jobs (source, deduplication_key)
+);
 
 CREATE INDEX IF NOT EXISTS idx_job_processing_queue
     ON job_processing (source, processing_status, fetch_next_retry_at);

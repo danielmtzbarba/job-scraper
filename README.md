@@ -54,7 +54,7 @@ The IAM user has `USAGE` and `CREATE` on the `public` schema. This narrow grant 
 GRANT USAGE, CREATE ON SCHEMA public TO "deatheater.dm@gmail.com";
 ```
 
-All eight application tables and their indexes were created and verified. Starting the API or scoring CLI checks that the tables exist; schema creation stays with the table owner rather than the restricted runtime identity. The Cloud Run service account `job-scraper-run@jobsearch-danielmtz-2026.iam.gserviceaccount.com` uses database username `job-scraper-run@jobsearch-danielmtz-2026.iam` in `CLOUD_SQL_IAM_USER`. It has the Cloud SQL Client and Instance User IAM roles and `SELECT, INSERT, UPDATE, DELETE` on the eight existing application tables, without schema creation rights. A keyless connection and application initialization succeeded as that identity. On Python installations without a usable system CA bundle, put `SSL_CERT_FILE` in the ignored `.env` and set it to the absolute path printed by `.venv/bin/python -c 'import certifi; print(certifi.where())'`. The API and CLI load this setting before importing the Cloud SQL connector, which is necessary because its `aiohttp` dependency creates a TLS context at import time. Certificate verification stays enabled.
+The eight original application tables and their indexes were created and verified. The `application_attempts` table was added on 2026-10-09 using [`deploy/migrations/2026-10-09-application-attempts.sql`](deploy/migrations/2026-10-09-application-attempts.sql). Starting the API or scoring CLI checks that the original tables exist; schema creation stays with the table owner rather than the restricted runtime identity. The Cloud Run service account `job-scraper-run@jobsearch-danielmtz-2026.iam.gserviceaccount.com` uses database username `job-scraper-run@jobsearch-danielmtz-2026.iam` in `CLOUD_SQL_IAM_USER`. It has the Cloud SQL Client and Instance User IAM roles and `SELECT, INSERT, UPDATE, DELETE` on all nine application tables, without schema creation rights. A keyless connection and application initialization succeeded as that identity before the ninth table was added; its new table grant was verified from the owner connection. On Python installations without a usable system CA bundle, put `SSL_CERT_FILE` in the ignored `.env` and set it to the absolute path printed by `.venv/bin/python -c 'import certifi; print(certifi.where())'`. The API and CLI load this setting before importing the Cloud SQL connector, which is necessary because its `aiohttp` dependency creates a TLS context at import time. Certificate verification stays enabled.
 
 On 2026-10-04, the one-time import copied and verified 714 jobs, 775 processing records, 24 score provenance records, 714 source aliases, and 7 search runs from `.local/jobs.db`. It maps old `ReadyToSync`/`Synced` processing states to `Completed` and omits Airtable-only sync fields. The SQLite file remains intact. To preview or repeat the import after configuring the Cloud SQL variables above:
 
@@ -91,7 +91,20 @@ curl -F 'file=@.local/dresden-results.html' \
 
 That local `curl` command uploads a file to your local API; it does not request the BA page. The API parses each card and inserts it only when the source/job ID deduplication key is new. New entries start with `Saved` application status and `Pending` fit status.
 
-### Scored jobs UI prototype
+### Scored jobs and application review
+
+The current local FastAPI `/jobs` page has an **Application links** filter. It shows **Start or continue** in the Application column for saved scored jobs that have an application URL. That action opens `/applications/{attempt_id}`. A current saved classification is required when starting an attempt, and a mapped PDF is required before preparing the filled review. The local SQLite snapshot may contain application links without classifications; in that case the action explains why it cannot proceed. The Cloud Run page still serves an older read-only build.
+
+For a local review session without scheduled collection or background classification/scoring, start the API with:
+
+```sh
+JOB_SCRAPER_STORAGE=sqlite JOB_SCRAPER_PAUSE_BACKGROUND_WORKERS=1 \
+  uv run uvicorn job_scraper.api:app --host 127.0.0.1 --port 8000
+```
+
+To browse the classified Cloud SQL jobs through the local review UI, use `JOB_SCRAPER_STORAGE=cloudsql` in that command. The attempt table and runtime grant are present in Cloud SQL. This starts only the local API; the background workers remain paused. The prepared PDF mapping in `.local/application/cv-map.json` is still needed before filling a form for review.
+
+The FastAPI server must be running for the button and review page to work. Opening an already-loaded browser tab after the server stops does not refresh its HTML or job data.
 
 The throwaway top-score table has three layout variants and reads scored jobs from Cloud SQL without starting collection or model workers. Run:
 

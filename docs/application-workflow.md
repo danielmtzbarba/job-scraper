@@ -1,6 +1,6 @@
-# Job application workflow (design)
+# Job application workflow
 
-Status: design only. No application automation has been implemented or authorized.
+Status: local MCP workflow and `/applications/{attempt_id}` review page implemented. The PostgreSQL attempt-table migration was applied to Cloud SQL on 2026-10-09. No real application has been submitted with this workflow.
 
 ## Goal
 
@@ -10,13 +10,13 @@ Start from a scored job row, use its saved classification to choose the prepared
 
 1. **Select jobs.** The user selects one or more scored rows (the initial discovery batch may be 10–20). Verify the stored fit result, posting metadata, and application URL. Do not infer the role from fit score.
 2. **Check classification.** Load the persisted classification result and its profile/version. Stop and ask the user if classification is absent, stale, conflicting, or unclear. Do not substitute `role_matches` or infer a CV from the score.
-3. **Create an attempt.** Create a private per-job attempt under `.local/application/attempts/<attempt-id>/`. Keep the job ID, URL, selected CV variant, form observations, draft values, screenshots/captured views, and upload staging here. This data is temporary and must be retained only until the user explicitly marks the attempt **Submitted** or **Discarded**.
+3. **Create an attempt.** Insert small process metadata in `application_attempts` and create a private per-job attempt under `.local/application/attempts/<attempt-id>/`. The database stores no form answers or screenshots. The private artifacts are retained only until the user explicitly marks the attempt **Submitted** or **Discarded**.
 4. **Inspect the form.** Navigate to the application URL and discover all visible and conditional steps before calling the form ready. Record each question, whether required, field type/options, and the page/step where it appeared. Do not invent answers. If a question or its meaning is unclear, pause and ask the user; retain the attempt while waiting.
 5. **Prepare answers.** Read reusable, user-approved facts from `.local/application/answers.yaml`. Apply only facts whose meaning matches the form field. Record per-field provenance (fact key or user response) and confidence in the attempt. Leave unknowns unanswered and ask. Employer-specific choices (including talent-pool consent) are not reusable facts.
-6. **Choose and stage the CV.** Resolve the classified profile to a prepared PDF in `.local/application/cvs/` using the mapping in `.local/application/cv-map.yaml`. Verify the file exists and show its variant and filename in the review. Never upload a different variant silently. Missing or ambiguous mapping pauses the attempt.
+6. **Choose and stage the CV.** Resolve the classified profile to a prepared PDF using `.local/application/cv-map.json`. Verify the file exists and show its variant and filename in the review. Never upload a different variant silently. Missing or ambiguous mapping pauses the attempt.
 7. **Fill, but do not submit.** Fill fields and attach the selected PDF. For the first pilot, capture the completed form and a readable list of every answer, selected option, consent, and uploaded filename. Present that review to the user.
 8. **Wait for explicit final approval.** Do not click a final submit control until the user explicitly approves this specific application after reviewing the captured form. A general preference or earlier approval of facts is not submit approval. If the user requests a change, revise and show the updated review.
-9. **Submit and verify.** After approval, submit once, inspect the confirmation/result, and update the job's application status only when submission is confirmed. Retain the minimal durable application record (job, employer, submitted time, status, confirmation/reference if available, CV variant) as needed for tracking; do not retain the temporary form capture or draft payload.
+9. **Submit and verify.** After approval, persist the approved digest and `Submitting` state before the browser click. Submit once, inspect the confirmation/result, and update the job's application status only when submission is confirmed. The current durable outcome is `jobs.application_status = Applied`; submission time, confirmation reference, and CV variant are not yet stored after closure.
 10. **Close and erase the attempt.** On explicit **Submitted** or **Discarded**, delete that attempt's temporary files and state. A timeout, browser failure, unclear answer, or waiting state is not an explicit discard and does not authorize deletion. If submission fails, ask whether to retry or discard; keep the attempt until the user decides.
 
 ## Retention and privacy
@@ -32,7 +32,7 @@ Start from a scored job row, use its saved classification to choose the prepared
 All paths below are local-only and covered by `.gitignore`'s `.local/` rule:
 
 - `.local/application/answers.yaml` — progressive user-approved answer facts.
-- `.local/application/cv-map.yaml` — mapping from saved classification/profile identifiers to prepared PDF paths.
+- `.local/application/cv-map.json` — mapping from saved classification/profile identifiers to prepared PDF paths.
 - `.local/application/cvs/` — prepared, compiled PDF variants to upload. No compiled PDFs were found in the project's existing `.local/` files during this design pass; the user's current source directory is not yet known. Copy or reference the already-prepared PDFs here only after their location is supplied. Do not regenerate them as part of the pilot.
 - `.local/application/attempts/` — temporary per-application records, subject to the explicit submit/discard deletion rule above.
 
@@ -40,9 +40,15 @@ The map should point to the existing classified profile/CV variant; it must not 
 
 ## Shared module boundary (MCP and ADK)
 
-The shared Python application service should expose a small operation set such as `start_attempt(job_id)`, `inspect_form(attempt_id)`, `prepare_answers(attempt_id)`, `fill_for_review(attempt_id)`, `get_review(attempt_id)`, `submit(attempt_id, explicit_approval)`, and `discard(attempt_id)`. MCP tools and ADK tools should be thin adapters over these same operations, so classification checks, consent gates, retention, and submit confirmation cannot diverge by client. The browser driver is behind an interface so local/manual pilot control can be used before selecting an automation backend. This is a proposed interface, not implemented code.
+The shared Python implementation is `job_scraper.application.application_workflow.ApplicationWorkflow`; MCP tools adapt its readiness, attempt, inspect, answer, review, submit, and discard operations. MCP tools and a future ADK adapter should call the same module so classification checks, consent gates, retention, and submit confirmation cannot diverge by client. Playwright is the initial browser driver. The current implementation inspects only the visible page and does not advance multi-step forms. This code is local only and has not been deployed or run against a real application.
 
-Each operation should be idempotent where practical and record a small state transition (`Selected → Inspecting → NeedsUserInput → ReadyForReview → ApprovedToSubmit → Submitted` or `Discarded`). Only `ApprovedToSubmit` can call the final submit action. A distinct `NeedsUserInput` state preserves context and pauses execution.
+The implementation records active process state, profile and CV variant, review version and digest, and approval timestamps in `application_attempts`. SQLite creates this table locally; [the migration](../deploy/migrations/2026-10-09-application-attempts.sql) was applied to Cloud SQL on 2026-10-09. The table enforces one active attempt per job. The review page and MCP tools call the same module. Final approval atomically claims the persisted review digest before the browser click. A possible click without verified confirmation leaves `SubmissionUnverified`, which cannot be retried or edited. Confirming submission sets the job outcome to `Applied` and deletes the attempt row; discard deletes the row without changing the job outcome. Both closure paths erase the private artifacts.
+
+The general MCP `update_application_status` tool refuses `Applied`; that transition goes through the shared workflow's confirmation path. The `/jobs` Application column remains the job outcome and offers **Start or continue** for eligible rows. The review page shows the captured form, exact proposed answers, CV filename, employer-specific consent choices, and explicit submit/discard actions. Responses containing attempt data have `Cache-Control: no-store`.
+
+MCP tools currently include `check_application_readiness`, `start_application_attempt`, `inspect_application_form`, `get_application_facts`, `add_approved_application_fact`, `save_application_answers`, `prepare_application_review`, `submit_application`, `confirm_application_submitted`, and `discard_application_attempt`. The caller must use only approved facts and ask the user about unclear fields and employer-specific consent. `add_approved_application_fact` appends a new key and will not overwrite an existing fact. Selecting a talent pool or group-sharing option requires a separate approved selector in the pilot.
+
+Known implementation limits: form inspection does not advance to later steps; automated filling currently supports inspected CSS-addressable controls and the first file input; no live form has been exercised in this implementation pass. Cloud Run attempts fail closed because `.local` artifacts would be lost on instance replacement. Before remote use, select persistent private artifact storage and deploy the application workflow code. The current browser route is local only. Verify end-to-end browser behavior on a safe test form before a real pilot.
 
 ## Questions for later design
 
