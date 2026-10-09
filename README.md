@@ -17,7 +17,7 @@ gcloud run services proxy job-scraper \
 
 The first revision was deployed from this repository with `gcloud run deploy --source .`, using the Dockerfile, the tracked environment file, runtime service account `job-scraper-run@jobsearch-danielmtz-2026.iam.gserviceaccount.com`, an IAM-only ingress policy, 1 vCPU, 2 GiB memory, min/max one instance, unthrottled CPU, and a read-only Cloud Storage volume mounted at `/app/.local/profiles` with `only-dir=releases/d91feaf2493767d2`. Preserve these settings on subsequent revisions. The in-process scheduler still needs restart-safe catch-up and DST review, and remote MCP client authentication has not been configured.
 
-Revision `job-scraper-00003-ffd` (2026-10-09) serves the application-links filter and review routes. Cloud Run attempt creation deliberately returns a workflow error until private attempt artifacts have persistent storage; the local API can use Cloud SQL attempts now. No employer application has been submitted through the deployed workflow.
+Revision `job-scraper-00004-gn2` (2026-10-09) serves the guided application workflow, `/applications` history, and content-free audit events. Cloud Run attempt creation and reusable fact edits deliberately return a workflow error until private application artifacts have persistent storage; the local API can use Cloud SQL attempts now. No employer application has been submitted through the deployed workflow.
 
 ## Local prerequisites
 
@@ -81,7 +81,7 @@ Application logs use structured `structlog`: local console lines use `[ INFO ] :
 
 The MCP SDK's Streamable HTTP session messages use the same format. `mcp_session_created` and `mcp_session_terminated` mark session lifecycle events. `mcp_session_rejected` is a DEBUG event (hidden at the default INFO level): it means a client sent an unknown or expired session ID; the request receives HTTP 404 and the client must initialize a new session. Repeated rejections for one ID usually mean the client is still retrying a stale session after a restart or termination.
 
-Open `/status` for the read-only daily workflow view. It shows today's ten scheduled searches in Europe/Berlin, marks a slot missed ten minutes after its scheduled time if no run was recorded, flags runs still in progress after 90 minutes, and summarizes the current detail, classification, and scoring queues. The Unapplied roles card counts jobs whose application status is `Saved`. `/api/status` returns the same data as JSON. The page reads the existing database; it does not start or retry work. The displayed worker failures are recent historical records and may include attempts that later succeeded. This route is currently implemented locally and requires a new deployment before it appears on Cloud Run.
+Open `/status` for the read-only daily workflow view. It shows today's ten scheduled searches in Europe/Berlin, marks a slot missed ten minutes after its scheduled time if no run was recorded, flags runs still in progress after 90 minutes, and summarizes the current detail, classification, and scoring queues. The Unapplied roles card counts jobs whose application status is `Saved`. `/api/status` returns the same data as JSON. The page reads the existing database; it does not start or retry work. The displayed worker failures are recent historical records and may include attempts that later succeeded. This route is deployed on Cloud Run.
 
 Open `http://127.0.0.1:8000/docs` for the interactive API documentation. Import a saved search-results page with all its cards:
 
